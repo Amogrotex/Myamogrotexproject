@@ -24,208 +24,685 @@ on:
         required: true
         default: 'CloudAdmin'
 
-  # Auto re-trigger itself via repository_dispatch
-  repository_dispatch:
-    types: [rdp-continue]
-
 jobs:
-  # ============================================================
-  # SESSION MANAGER - Decides how many sessions to run
-  # ============================================================
-  session-manager:
-    runs-on: ubuntu-latest
-    outputs:
-      run_s1: ${{ steps.plan.outputs.run_s1 }}
-      run_s2: ${{ steps.plan.outputs.run_s2 }}
-      run_s3: ${{ steps.plan.outputs.run_s3 }}
-      run_s4: ${{ steps.plan.outputs.run_s4 }}
-      run_s5: ${{ steps.plan.outputs.run_s5 }}
-      run_s6: ${{ steps.plan.outputs.run_s6 }}
-      hostname: ${{ steps.plan.outputs.hostname }}
-      username: ${{ steps.plan.outputs.username }}
-
-    steps:
-      - name: 📋 Plan Sessions
-        id: plan
-        run: |
-          # Get inputs (handle both manual and auto-trigger)
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            SESSIONS="${{ github.event.client_payload.sessions }}"
-            HOSTNAME="${{ github.event.client_payload.hostname }}"
-            USERNAME="${{ github.event.client_payload.username }}"
-          else
-            SESSIONS="${{ github.event.inputs.sessions }}"
-            HOSTNAME="${{ github.event.inputs.hostname }}"
-            USERNAME="${{ github.event.inputs.rdp_username }}"
-          fi
-
-          echo "Total sessions requested: $SESSIONS"
-          echo "hostname=$HOSTNAME"   >> $GITHUB_OUTPUT
-          echo "username=$USERNAME"   >> $GITHUB_OUTPUT
-
-          # Enable sessions based on count
-          for i in 1 2 3 4 5 6; do
-            if [ "$i" -le "$SESSIONS" ]; then
-              echo "run_s$i=true"  >> $GITHUB_OUTPUT
-            else
-              echo "run_s$i=false" >> $GITHUB_OUTPUT
-            fi
-          done
-
-          echo ""
-          echo "Session Plan:"
-          for i in 1 2 3 4 5 6; do
-            if [ "$i" -le "$SESSIONS" ]; then
-              echo "  Session $i: ✅ ENABLED"
-            else
-              echo "  Session $i: ⏭️  SKIPPED"
-            fi
-          done
-
   # ============================================================
   # SESSION 1 - Hours 1-6
   # ============================================================
   session-1:
-    needs: session-manager
-    if: needs.session-manager.outputs.run_s1 == 'true'
     runs-on: windows-latest
     timeout-minutes: 360
-    env:
-      SESSION_NUM: 1
-      HOSTNAME: ${{ needs.session-manager.outputs.hostname }}
-      USERNAME: ${{ needs.session-manager.outputs.username }}
-
     steps:
-      - name: 🚀 Setup & Run Session 1
-        uses: ./.github/actions/rdp-session
-        with:
-          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          rdp_password: ${{ secrets.RDP_PASSWORD }}
-          session_num: "1"
-          hostname: ${{ needs.session-manager.outputs.hostname }}
-          username: ${{ needs.session-manager.outputs.username }}
-        continue-on-error: true
+
+      - name: 🔧 System Info
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║       WINDOWS CLOUD RDP - SESSION 1 / 6         ║" -ForegroundColor Cyan
+          Write-Host "║       Hours 1 - 6                                ║" -ForegroundColor Cyan
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+          Write-Host ""
+          Write-Host "  OS   : $((Get-WmiObject Win32_OperatingSystem).Caption)" -ForegroundColor Yellow
+          Write-Host "  CPU  : $((Get-WmiObject Win32_Processor).Name)" -ForegroundColor Yellow
+          Write-Host "  RAM  : $([math]::Round((Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)) GB" -ForegroundColor Yellow
+          Write-Host "  Disk : $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB free" -ForegroundColor Yellow
+          Write-Host "  Time : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC" -ForegroundColor Yellow
+          Write-Host ""
+
+      - name: 🖥️ Enable Remote Desktop
+        run: |
+          Write-Host "[*] Enabling Remote Desktop..." -ForegroundColor Cyan
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "[✓] Remote Desktop ENABLED" -ForegroundColor Green
+
+      - name: 👤 Create Admin User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_USERNAME: ${{ github.event.inputs.rdp_username }}
+        run: |
+          echo "::add-mask::$Env:RDP_PASSWORD"
+          $username   = $Env:RDP_USERNAME
+          $password   = $Env:RDP_PASSWORD
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          New-LocalUser -Name $username -Password $securePass `
+            -FullName "Cloud RDP Admin" -PasswordNeverExpires `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction SilentlyContinue
+          net user runneradmin $password 2>$null
+
+          Write-Host "[✓] User '$username' configured" -ForegroundColor Green
+
+      - name: 📦 Install Tools via Chocolatey
+        run: |
+          Write-Host "[*] Installing Chocolatey..." -ForegroundColor Cyan
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+          iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+          $tools = @("googlechrome", "vscode", "git", "7zip", "notepadplusplus", "python")
+          foreach ($tool in $tools) {
+            Write-Host "[*] Installing $tool..." -ForegroundColor Cyan
+            choco install $tool -y --no-progress 2>$null
+            Write-Host "[✓] $tool done" -ForegroundColor Green
+          }
+
+      - name: 🌐 Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          Write-Host "[*] Downloading Tailscale..." -ForegroundColor Cyan
+
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$Env:TEMP\tailscale.msi" -UseBasicParsing
+
+          Start-Process msiexec -ArgumentList "/i $Env:TEMP\tailscale.msi /quiet /norestart" -Wait
+          Write-Host "[✓] Tailscale installed" -ForegroundColor Green
+
+          Start-Sleep -Seconds 5
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          $hostname  = "${{ github.event.inputs.hostname }}-s1-${{ github.run_id }}"
+
+          & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="$hostname" --shields-up=false
+
+          Start-Sleep -Seconds 8
+
+          $ts_ip = & $tailscale ip -4
+          echo "TAILSCALE_IP=$ts_ip" >> $Env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║         ✅ SESSION 1 READY TO CONNECT            ║" -ForegroundColor Green
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║  IP       : $ts_ip" -ForegroundColor Yellow
+          Write-Host "║  Username : ${{ github.event.inputs.rdp_username }}" -ForegroundColor Yellow
+          Write-Host "║  Password : [RDP_PASSWORD Secret]                ║" -ForegroundColor Yellow
+          Write-Host "║  Connect  : mstsc /v:$ts_ip" -ForegroundColor Cyan
+          Write-Host "║  Session  : 1 / 6  (Hours 1-6)                   ║" -ForegroundColor Magenta
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+
+      - name: ⏳ Keep Alive - Session 1 (6 Hours)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          $tailscale    = "C:\Program Files\Tailscale\tailscale.exe"
+          $totalMinutes = 355
+
+          for ($i = 1; $i -le $totalMinutes; $i++) {
+            Start-Sleep -Seconds 60
+            $remaining = $totalMinutes - $i
+            $percent   = [math]::Round(($i / $totalMinutes) * 100)
+            $filled    = [math]::Round($percent / 5)
+            $bar       = ("█" * $filled) + ("░" * (20 - $filled))
+            Write-Host "  S1 | [$bar] $percent% | ${i}m elapsed | ${remaining}m left" -ForegroundColor Cyan
+
+            if ($i % 15 -eq 0) {
+              $svc = Get-Service "TermService" -ErrorAction SilentlyContinue
+              if ($svc.Status -ne "Running") { Start-Service "TermService" }
+
+              try {
+                $status = & $tailscale status --json | ConvertFrom-Json
+                if ($status.BackendState -ne "Running") {
+                  Write-Host "  [!] Reconnecting Tailscale..." -ForegroundColor Yellow
+                  & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --shields-up=false
+                } else {
+                  $ts_ip = & $tailscale ip -4
+                  Write-Host "  [✓] Tailscale OK: $ts_ip" -ForegroundColor Green
+                }
+              } catch {
+                Write-Host "  [!] Tailscale check failed" -ForegroundColor Yellow
+              }
+
+              $cpu  = (Get-WmiObject Win32_Processor).LoadPercentage
+              $ram  = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+              $disk = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+              Write-Host "  [📊] CPU: $cpu% | Free RAM: ${ram}GB | Free Disk: ${disk}GB" -ForegroundColor Gray
+            }
+
+            if ($remaining -eq 10) {
+              Write-Host "  ⚠️  Session 1 ends in 10 min - Session 2 starts next!" -ForegroundColor Red
+            }
+          }
+          Write-Host "[✓] Session 1 Complete!" -ForegroundColor Green
 
   # ============================================================
   # SESSION 2 - Hours 7-12
   # ============================================================
   session-2:
-    needs: [session-manager, session-1]
-    if: |
-      always() &&
-      needs.session-manager.outputs.run_s2 == 'true'
+    needs: session-1
+    if: always() && inputs.sessions >= '2'
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: 🚀 Setup & Run Session 2
-        uses: ./.github/actions/rdp-session
-        with:
-          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          rdp_password: ${{ secrets.RDP_PASSWORD }}
-          session_num: "2"
-          hostname: ${{ needs.session-manager.outputs.hostname }}
-          username: ${{ needs.session-manager.outputs.username }}
-        continue-on-error: true
+
+      - name: 🔧 System Info
+        run: |
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║       WINDOWS CLOUD RDP - SESSION 2 / 6         ║" -ForegroundColor Cyan
+          Write-Host "║       Hours 7 - 12                               ║" -ForegroundColor Cyan
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+      - name: 🖥️ Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "[✓] Remote Desktop ENABLED" -ForegroundColor Green
+
+      - name: 👤 Create Admin User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_USERNAME: ${{ github.event.inputs.rdp_username }}
+        run: |
+          echo "::add-mask::$Env:RDP_PASSWORD"
+          $securePass = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $Env:RDP_USERNAME -Password $securePass -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          net user runneradmin $Env:RDP_PASSWORD 2>$null
+          Write-Host "[✓] User configured" -ForegroundColor Green
+
+      - name: 🌐 Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$Env:TEMP\tailscale.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i $Env:TEMP\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --hostname="${{ github.event.inputs.hostname }}-s2-${{ github.run_id }}" --shields-up=false
+
+          Start-Sleep -Seconds 8
+          $ts_ip = & $tailscale ip -4
+          echo "TAILSCALE_IP=$ts_ip" >> $Env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║         ✅ SESSION 2 READY TO CONNECT            ║" -ForegroundColor Green
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║  IP       : $ts_ip" -ForegroundColor Yellow
+          Write-Host "║  Username : ${{ github.event.inputs.rdp_username }}" -ForegroundColor Yellow
+          Write-Host "║  Connect  : mstsc /v:$ts_ip" -ForegroundColor Cyan
+          Write-Host "║  Session  : 2 / 6  (Hours 7-12)                  ║" -ForegroundColor Magenta
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+
+      - name: ⏳ Keep Alive - Session 2 (6 Hours)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          $tailscale    = "C:\Program Files\Tailscale\tailscale.exe"
+          $totalMinutes = 355
+
+          for ($i = 1; $i -le $totalMinutes; $i++) {
+            Start-Sleep -Seconds 60
+            $remaining = $totalMinutes - $i
+            $percent   = [math]::Round(($i / $totalMinutes) * 100)
+            $filled    = [math]::Round($percent / 5)
+            $bar       = ("█" * $filled) + ("░" * (20 - $filled))
+            Write-Host "  S2 | [$bar] $percent% | ${i}m elapsed | ${remaining}m left" -ForegroundColor Cyan
+
+            if ($i % 15 -eq 0) {
+              $svc = Get-Service "TermService" -ErrorAction SilentlyContinue
+              if ($svc.Status -ne "Running") { Start-Service "TermService" }
+              try {
+                $status = & $tailscale status --json | ConvertFrom-Json
+                if ($status.BackendState -ne "Running") {
+                  & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --shields-up=false
+                } else {
+                  Write-Host "  [✓] Tailscale OK: $(& $tailscale ip -4)" -ForegroundColor Green
+                }
+              } catch {}
+              $cpu  = (Get-WmiObject Win32_Processor).LoadPercentage
+              $ram  = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+              Write-Host "  [📊] CPU: $cpu% | Free RAM: ${ram}GB" -ForegroundColor Gray
+            }
+            if ($remaining -eq 10) {
+              Write-Host "  ⚠️  Session 2 ends in 10 min - Session 3 starts next!" -ForegroundColor Red
+            }
+          }
+          Write-Host "[✓] Session 2 Complete!" -ForegroundColor Green
 
   # ============================================================
   # SESSION 3 - Hours 13-18
   # ============================================================
   session-3:
-    needs: [session-manager, session-2]
-    if: |
-      always() &&
-      needs.session-manager.outputs.run_s3 == 'true'
+    needs: session-2
+    if: always() && inputs.sessions >= '3'
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: 🚀 Setup & Run Session 3
-        uses: ./.github/actions/rdp-session
-        with:
-          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          rdp_password: ${{ secrets.RDP_PASSWORD }}
-          session_num: "3"
-          hostname: ${{ needs.session-manager.outputs.hostname }}
-          username: ${{ needs.session-manager.outputs.username }}
-        continue-on-error: true
+
+      - name: 🔧 System Info
+        run: |
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║       WINDOWS CLOUD RDP - SESSION 3 / 6         ║" -ForegroundColor Cyan
+          Write-Host "║       Hours 13 - 18                              ║" -ForegroundColor Cyan
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+      - name: 🖥️ Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "[✓] Remote Desktop ENABLED" -ForegroundColor Green
+
+      - name: 👤 Create Admin User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_USERNAME: ${{ github.event.inputs.rdp_username }}
+        run: |
+          echo "::add-mask::$Env:RDP_PASSWORD"
+          $securePass = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $Env:RDP_USERNAME -Password $securePass -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          net user runneradmin $Env:RDP_PASSWORD 2>$null
+          Write-Host "[✓] User configured" -ForegroundColor Green
+
+      - name: 🌐 Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$Env:TEMP\tailscale.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i $Env:TEMP\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --hostname="${{ github.event.inputs.hostname }}-s3-${{ github.run_id }}" --shields-up=false
+
+          Start-Sleep -Seconds 8
+          $ts_ip = & $tailscale ip -4
+          echo "TAILSCALE_IP=$ts_ip" >> $Env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║         ✅ SESSION 3 READY TO CONNECT            ║" -ForegroundColor Green
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║  IP       : $ts_ip" -ForegroundColor Yellow
+          Write-Host "║  Username : ${{ github.event.inputs.rdp_username }}" -ForegroundColor Yellow
+          Write-Host "║  Connect  : mstsc /v:$ts_ip" -ForegroundColor Cyan
+          Write-Host "║  Session  : 3 / 6  (Hours 13-18)                 ║" -ForegroundColor Magenta
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+
+      - name: ⏳ Keep Alive - Session 3 (6 Hours)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          $tailscale    = "C:\Program Files\Tailscale\tailscale.exe"
+          $totalMinutes = 355
+
+          for ($i = 1; $i -le $totalMinutes; $i++) {
+            Start-Sleep -Seconds 60
+            $remaining = $totalMinutes - $i
+            $percent   = [math]::Round(($i / $totalMinutes) * 100)
+            $filled    = [math]::Round($percent / 5)
+            $bar       = ("█" * $filled) + ("░" * (20 - $filled))
+            Write-Host "  S3 | [$bar] $percent% | ${i}m elapsed | ${remaining}m left" -ForegroundColor Cyan
+
+            if ($i % 15 -eq 0) {
+              $svc = Get-Service "TermService" -ErrorAction SilentlyContinue
+              if ($svc.Status -ne "Running") { Start-Service "TermService" }
+              try {
+                $status = & $tailscale status --json | ConvertFrom-Json
+                if ($status.BackendState -ne "Running") {
+                  & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --shields-up=false
+                } else {
+                  Write-Host "  [✓] Tailscale OK: $(& $tailscale ip -4)" -ForegroundColor Green
+                }
+              } catch {}
+              $cpu = (Get-WmiObject Win32_Processor).LoadPercentage
+              $ram = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+              Write-Host "  [📊] CPU: $cpu% | Free RAM: ${ram}GB" -ForegroundColor Gray
+            }
+            if ($remaining -eq 10) {
+              Write-Host "  ⚠️  Session 3 ends in 10 min - Session 4 starts next!" -ForegroundColor Red
+            }
+          }
+          Write-Host "[✓] Session 3 Complete!" -ForegroundColor Green
 
   # ============================================================
   # SESSION 4 - Hours 19-24
   # ============================================================
   session-4:
-    needs: [session-manager, session-3]
-    if: |
-      always() &&
-      needs.session-manager.outputs.run_s4 == 'true'
+    needs: session-3
+    if: always() && inputs.sessions >= '4'
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: 🚀 Setup & Run Session 4
-        uses: ./.github/actions/rdp-session
-        with:
-          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          rdp_password: ${{ secrets.RDP_PASSWORD }}
-          session_num: "4"
-          hostname: ${{ needs.session-manager.outputs.hostname }}
-          username: ${{ needs.session-manager.outputs.username }}
-        continue-on-error: true
+
+      - name: 🔧 System Info
+        run: |
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║       WINDOWS CLOUD RDP - SESSION 4 / 6         ║" -ForegroundColor Cyan
+          Write-Host "║       Hours 19 - 24                              ║" -ForegroundColor Cyan
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+      - name: 🖥️ Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "[✓] Remote Desktop ENABLED" -ForegroundColor Green
+
+      - name: 👤 Create Admin User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_USERNAME: ${{ github.event.inputs.rdp_username }}
+        run: |
+          echo "::add-mask::$Env:RDP_PASSWORD"
+          $securePass = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $Env:RDP_USERNAME -Password $securePass -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          net user runneradmin $Env:RDP_PASSWORD 2>$null
+          Write-Host "[✓] User configured" -ForegroundColor Green
+
+      - name: 🌐 Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$Env:TEMP\tailscale.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i $Env:TEMP\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --hostname="${{ github.event.inputs.hostname }}-s4-${{ github.run_id }}" --shields-up=false
+
+          Start-Sleep -Seconds 8
+          $ts_ip = & $tailscale ip -4
+          echo "TAILSCALE_IP=$ts_ip" >> $Env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║         ✅ SESSION 4 READY TO CONNECT            ║" -ForegroundColor Green
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║  IP       : $ts_ip" -ForegroundColor Yellow
+          Write-Host "║  Username : ${{ github.event.inputs.rdp_username }}" -ForegroundColor Yellow
+          Write-Host "║  Connect  : mstsc /v:$ts_ip" -ForegroundColor Cyan
+          Write-Host "║  Session  : 4 / 6  (Hours 19-24)                 ║" -ForegroundColor Magenta
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+
+      - name: ⏳ Keep Alive - Session 4 (6 Hours)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          $tailscale    = "C:\Program Files\Tailscale\tailscale.exe"
+          $totalMinutes = 355
+
+          for ($i = 1; $i -le $totalMinutes; $i++) {
+            Start-Sleep -Seconds 60
+            $remaining = $totalMinutes - $i
+            $percent   = [math]::Round(($i / $totalMinutes) * 100)
+            $filled    = [math]::Round($percent / 5)
+            $bar       = ("█" * $filled) + ("░" * (20 - $filled))
+            Write-Host "  S4 | [$bar] $percent% | ${i}m elapsed | ${remaining}m left" -ForegroundColor Cyan
+
+            if ($i % 15 -eq 0) {
+              $svc = Get-Service "TermService" -ErrorAction SilentlyContinue
+              if ($svc.Status -ne "Running") { Start-Service "TermService" }
+              try {
+                $status = & $tailscale status --json | ConvertFrom-Json
+                if ($status.BackendState -ne "Running") {
+                  & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --shields-up=false
+                } else {
+                  Write-Host "  [✓] Tailscale OK: $(& $tailscale ip -4)" -ForegroundColor Green
+                }
+              } catch {}
+              $cpu = (Get-WmiObject Win32_Processor).LoadPercentage
+              $ram = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+              Write-Host "  [📊] CPU: $cpu% | Free RAM: ${ram}GB" -ForegroundColor Gray
+            }
+            if ($remaining -eq 10) {
+              Write-Host "  ⚠️  Session 4 ends in 10 min - Session 5 starts next!" -ForegroundColor Red
+            }
+          }
+          Write-Host "[✓] Session 4 Complete!" -ForegroundColor Green
 
   # ============================================================
   # SESSION 5 - Hours 25-30
   # ============================================================
   session-5:
-    needs: [session-manager, session-4]
-    if: |
-      always() &&
-      needs.session-manager.outputs.run_s5 == 'true'
+    needs: session-4
+    if: always() && inputs.sessions >= '5'
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: 🚀 Setup & Run Session 5
-        uses: ./.github/actions/rdp-session
-        with:
-          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          rdp_password: ${{ secrets.RDP_PASSWORD }}
-          session_num: "5"
-          hostname: ${{ needs.session-manager.outputs.hostname }}
-          username: ${{ needs.session-manager.outputs.username }}
-        continue-on-error: true
+
+      - name: 🔧 System Info
+        run: |
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║       WINDOWS CLOUD RDP - SESSION 5 / 6         ║" -ForegroundColor Cyan
+          Write-Host "║       Hours 25 - 30                              ║" -ForegroundColor Cyan
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+      - name: 🖥️ Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "[✓] Remote Desktop ENABLED" -ForegroundColor Green
+
+      - name: 👤 Create Admin User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_USERNAME: ${{ github.event.inputs.rdp_username }}
+        run: |
+          echo "::add-mask::$Env:RDP_PASSWORD"
+          $securePass = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $Env:RDP_USERNAME -Password $securePass -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          net user runneradmin $Env:RDP_PASSWORD 2>$null
+          Write-Host "[✓] User configured" -ForegroundColor Green
+
+      - name: 🌐 Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$Env:TEMP\tailscale.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i $Env:TEMP\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --hostname="${{ github.event.inputs.hostname }}-s5-${{ github.run_id }}" --shields-up=false
+
+          Start-Sleep -Seconds 8
+          $ts_ip = & $tailscale ip -4
+          echo "TAILSCALE_IP=$ts_ip" >> $Env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║         ✅ SESSION 5 READY TO CONNECT            ║" -ForegroundColor Green
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║  IP       : $ts_ip" -ForegroundColor Yellow
+          Write-Host "║  Username : ${{ github.event.inputs.rdp_username }}" -ForegroundColor Yellow
+          Write-Host "║  Connect  : mstsc /v:$ts_ip" -ForegroundColor Cyan
+          Write-Host "║  Session  : 5 / 6  (Hours 25-30)                 ║" -ForegroundColor Magenta
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+
+      - name: ⏳ Keep Alive - Session 5 (6 Hours)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          $tailscale    = "C:\Program Files\Tailscale\tailscale.exe"
+          $totalMinutes = 355
+
+          for ($i = 1; $i -le $totalMinutes; $i++) {
+            Start-Sleep -Seconds 60
+            $remaining = $totalMinutes - $i
+            $percent   = [math]::Round(($i / $totalMinutes) * 100)
+            $filled    = [math]::Round($percent / 5)
+            $bar       = ("█" * $filled) + ("░" * (20 - $filled))
+            Write-Host "  S5 | [$bar] $percent% | ${i}m elapsed | ${remaining}m left" -ForegroundColor Cyan
+
+            if ($i % 15 -eq 0) {
+              $svc = Get-Service "TermService" -ErrorAction SilentlyContinue
+              if ($svc.Status -ne "Running") { Start-Service "TermService" }
+              try {
+                $status = & $tailscale status --json | ConvertFrom-Json
+                if ($status.BackendState -ne "Running") {
+                  & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --shields-up=false
+                } else {
+                  Write-Host "  [✓] Tailscale OK: $(& $tailscale ip -4)" -ForegroundColor Green
+                }
+              } catch {}
+              $cpu = (Get-WmiObject Win32_Processor).LoadPercentage
+              $ram = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+              Write-Host "  [📊] CPU: $cpu% | Free RAM: ${ram}GB" -ForegroundColor Gray
+            }
+            if ($remaining -eq 10) {
+              Write-Host "  ⚠️  Session 5 ends in 10 min - Session 6 starts next!" -ForegroundColor Red
+            }
+          }
+          Write-Host "[✓] Session 5 Complete!" -ForegroundColor Green
 
   # ============================================================
   # SESSION 6 - Hours 31-36
   # ============================================================
   session-6:
-    needs: [session-manager, session-5]
-    if: |
-      always() &&
-      needs.session-manager.outputs.run_s6 == 'true'
+    needs: session-5
+    if: always() && inputs.sessions >= '6'
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: 🚀 Setup & Run Session 6
-        uses: ./.github/actions/rdp-session
-        with:
-          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          rdp_password: ${{ secrets.RDP_PASSWORD }}
-          session_num: "6"
-          hostname: ${{ needs.session-manager.outputs.hostname }}
-          username: ${{ needs.session-manager.outputs.username }}
-        continue-on-error: true
+
+      - name: 🔧 System Info
+        run: |
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+          Write-Host "║       WINDOWS CLOUD RDP - SESSION 6 / 6         ║" -ForegroundColor Cyan
+          Write-Host "║       Hours 31 - 36  *** FINAL SESSION ***       ║" -ForegroundColor Cyan
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+
+      - name: 🖥️ Enable Remote Desktop
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fSingleSessionPerUser" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "[✓] Remote Desktop ENABLED" -ForegroundColor Green
+
+      - name: 👤 Create Admin User
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          RDP_USERNAME: ${{ github.event.inputs.rdp_username }}
+        run: |
+          echo "::add-mask::$Env:RDP_PASSWORD"
+          $securePass = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          New-LocalUser -Name $Env:RDP_USERNAME -Password $securePass -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+          net user runneradmin $Env:RDP_PASSWORD 2>$null
+          Write-Host "[✓] User configured" -ForegroundColor Green
+
+      - name: 🌐 Install & Connect Tailscale
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$Env:TEMP\tailscale.msi" -UseBasicParsing
+          Start-Process msiexec -ArgumentList "/i $Env:TEMP\tailscale.msi /quiet /norestart" -Wait
+          Start-Sleep -Seconds 5
+
+          $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+          & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" `
+            --hostname="${{ github.event.inputs.hostname }}-s6-${{ github.run_id }}" --shields-up=false
+
+          Start-Sleep -Seconds 8
+          $ts_ip = & $tailscale ip -4
+          echo "TAILSCALE_IP=$ts_ip" >> $Env:GITHUB_ENV
+
+          Write-Host ""
+          Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Green
+          Write-Host "║     ✅ SESSION 6 (FINAL) READY TO CONNECT        ║" -ForegroundColor Green
+          Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Green
+          Write-Host "║  IP       : $ts_ip" -ForegroundColor Yellow
+          Write-Host "║  Username : ${{ github.event.inputs.rdp_username }}" -ForegroundColor Yellow
+          Write-Host "║  Connect  : mstsc /v:$ts_ip" -ForegroundColor Cyan
+          Write-Host "║  Session  : 6 / 6  (Hours 31-36) FINAL           ║" -ForegroundColor Magenta
+          Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Green
+
+      - name: ⏳ Keep Alive - Session 6 (6 Hours)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+          $tailscale    = "C:\Program Files\Tailscale\tailscale.exe"
+          $totalMinutes = 355
+
+          for ($i = 1; $i -le $totalMinutes; $i++) {
+            Start-Sleep -Seconds 60
+            $remaining = $totalMinutes - $i
+            $percent   = [math]::Round(($i / $totalMinutes) * 100)
+            $filled    = [math]::Round($percent / 5)
+            $bar       = ("█" * $filled) + ("░" * (20 - $filled))
+            Write-Host "  S6 | [$bar] $percent% | ${i}m elapsed | ${remaining}m left" -ForegroundColor Cyan
+
+            if ($i % 15 -eq 0) {
+              $svc = Get-Service "TermService" -ErrorAction SilentlyContinue
+              if ($svc.Status -ne "Running") { Start-Service "TermService" }
+              try {
+                $status = & $tailscale status --json | ConvertFrom-Json
+                if ($status.BackendState -ne "Running") {
+                  & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --shields-up=false
+                } else {
+                  Write-Host "  [✓] Tailscale OK: $(& $tailscale ip -4)" -ForegroundColor Green
+                }
+              } catch {}
+              $cpu = (Get-WmiObject Win32_Processor).LoadPercentage
+              $ram = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+              Write-Host "  [📊] CPU: $cpu% | Free RAM: ${ram}GB" -ForegroundColor Gray
+            }
+            if ($remaining -eq 10) {
+              Write-Host "  🏁 FINAL SESSION ends in 10 minutes!" -ForegroundColor Red
+            }
+          }
+          Write-Host ""
+          Write-Host "[✓] ALL 6 SESSIONS COMPLETE - 36 HOURS TOTAL!" -ForegroundColor Green
 
   # ============================================================
   # SUMMARY
   # ============================================================
   summary:
-    needs: [session-manager, session-1, session-2, session-3, session-4, session-5, session-6]
+    needs: [session-1, session-2, session-3, session-4, session-5, session-6]
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: 📊 Session Summary
+      - name: 📊 Final Summary
         run: |
-          echo "================================="
-          echo "  RDP SESSION SUMMARY"
-          echo "================================="
-          echo "  Total Sessions : ${{ github.event.inputs.sessions }}"
-          echo "  Total Hours    : $(( ${{ github.event.inputs.sessions }} * 6 ))"
-          echo "  Hostname       : ${{ github.event.inputs.hostname }}"
-          echo "  Run ID         : ${{ github.run_id }}"
-          echo "================================="
+          echo "╔══════════════════════════════════════╗"
+          echo "║         RDP SESSION COMPLETE         ║"
+          echo "╠══════════════════════════════════════╣"
+          echo "║  Total Runtime : 36 Hours            ║"
+          echo "║  Sessions      : 6 x 6 Hours         ║"
+          echo "║  Run ID        : ${{ github.run_id }} ║"
+          echo "╚══════════════════════════════════════╝"
