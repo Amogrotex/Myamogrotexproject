@@ -79,6 +79,9 @@ jobs:
           RDP_PASSWORD: ${{ inputs.password }}
           RDP_HOURS: ${{ inputs.hours }}
         run: |
+          # Mask the password immediately so it can never appear in raw logs
+          Write-Output "::add-mask::$env:RDP_PASSWORD"
+
           # --- Tailscale auth key ---------------------------------------------------
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
             Write-Error "TAILSCALE_AUTHKEY secret is not set.`nAdd it: repo Settings > Secrets and variables > Actions > New repository secret.`nGet a key: https://login.tailscale.com/admin/settings/keys"
@@ -88,12 +91,22 @@ jobs:
             Write-Warning "TAILSCALE_AUTHKEY does not look like a Tailscale key (expected 'tskey-...'). Continuing anyway."
           }
           # --- Password ---------------------------------------------------------------
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+          # GitHub runner local policy requires: >= 8 chars AND >= 3 of 4 classes
+          # (upper, lower, digit, special). Checked here so you get a clear message
+          # instead of New-LocalUser's cryptic InvalidPasswordException.
+          $pw = $env:RDP_PASSWORD
+          if ([string]::IsNullOrWhiteSpace($pw)) {
             Write-Error "No password supplied. Open Actions > 'Windows Cloud RDP (Improved)' > Run workflow and type a password."
             exit 1
           }
-          if ($env:RDP_PASSWORD.Length -lt 8) {
-            Write-Warning "Password is shorter than 8 characters — Windows may reject it during RDP logon. Consider a stronger one."
+          $classes = 0
+          if ($pw -cmatch '[A-Z]') { $classes++ }
+          if ($pw -cmatch '[a-z]') { $classes++ }
+          if ($pw -cmatch '[0-9]') { $classes++ }
+          if ($pw -cmatch '[^A-Za-z0-9]') { $classes++ }
+          if ($pw.Length -lt 8 -or $classes -lt 3) {
+            Write-Error "The RDP password must be at least 8 characters and include at least 3 of: uppercase letter, lowercase letter, digit, special character (Windows password policy). Current: len=$($pw.Length), classes=$classes."
+            exit 1
           }
           # --- Hours -------------------------------------------------------------------
           $hours = [int]$env:RDP_HOURS
@@ -101,7 +114,7 @@ jobs:
             Write-Error "hours must be between 1 and 6 (got: $hours)."
             exit 1
           }
-          Write-Host "Configuration OK. Lifetime: $hours h. Password is masked."
+          Write-Host "Configuration OK. Lifetime: $hours h. Password meets policy and is masked."
 
       - name: 1. Enable Remote Desktop & firewall
         shell: pwsh
@@ -116,30 +129,58 @@ jobs:
           }
           Write-Host 'Remote Desktop enabled.'
 
-      - name: 2. Create local admin account
+      - name: 2. Create local admin account (net.exe — avoids New-LocalUser flakiness)
         shell: pwsh
         env:
           RDP_USERNAME: ${{ inputs.username }}
           RDP_PASSWORD: ${{ inputs.password }}
         run: |
-          # Mask the password first thing so it can never appear in raw logs
+          # Mask the password so it can never appear in raw logs
           Write-Output "::add-mask::$env:RDP_PASSWORD"
 
           $u  = $env:RDP_USERNAME
-          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $pw = $env:RDP_PASSWORD
 
-          if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
-            Set-LocalUser -Name $u -Password $pw
+          # GitHub windows runners always ship a built-in local admin: runneradmin.
+          # Reset its password so RDP logon works even with the default account.
+          & net.exe user runneradmin $pw | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not reset password for 'runneradmin' (exit $LASTEXITCODE) — continuing."
+          }
+
+          # Does the requested account already exist?
+          $exists = (& net.exe user $u 2>$null; $LASTEXITCODE -eq 0)
+
+          if ($u -eq 'runneradmin') {
+            Write-Host "'runneradmin' password was reset above — nothing else to create."
+          } elseif ($exists) {
+            # Existing user -> just reset the password
+            & net.exe user $u $pw | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "net user failed to reset password for '$u' (exit $LASTEXITCODE)."
+              exit 1
+            }
             Write-Host "User '$u' already exists — password updated."
           } else {
-            New-LocalUser -Name $u -Password $pw -PasswordNeverExpires -ErrorAction Stop | Out-Null
+            # New user -> create with net.exe, never expires
+            & net.exe user $u $pw /add /expires:never | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "net user /add failed for '$u' (exit $LASTEXITCODE)."
+              exit 1
+            }
             Write-Host "User '$u' created."
           }
-          Add-LocalGroupMember -Group 'Administrators' -Member $u -ErrorAction SilentlyContinue
 
-          # Keep the default runner account's password in sync as a fallback
-          net user runneradmin "$env:RDP_PASSWORD" | Out-Null
-          Write-Host "'$u' is now a local administrator."
+          # Make it a local administrator
+          & net.exe localgroup Administrators $u /add | Out-Null
+          if ($LASTEXITCODE -eq 2) {
+            # net.exe returns 2 when the account is already a member
+            Write-Host "'$u' is already a local administrator."
+          } elseif ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not add '$u' to Administrators (exit $LASTEXITCODE) — RDP may fail to log on."
+          } else {
+            Write-Host "'$u' is now a local administrator."
+          }
 
       - name: 3. Install Tailscale (curl + TLS 1.2 — avoids HTTP 426)
         shell: pwsh
