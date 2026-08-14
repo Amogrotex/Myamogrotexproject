@@ -1,0 +1,335 @@
+name: 'RDP Session'
+description: 'Sets up and runs a Windows RDP session'
+
+inputs:
+  tailscale_authkey:
+    description: 'Tailscale auth key'
+    required: true
+  rdp_password:
+    description: 'RDP password'
+    required: true
+  session_num:
+    description: 'Session number'
+    required: true
+  hostname:
+    description: 'Tailscale hostname'
+    required: true
+  username:
+    description: 'RDP username'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+
+    # ──────────────────────────────────────
+    - name: 🔧 System Info
+    # ──────────────────────────────────────
+      shell: pwsh
+      run: |
+        $session = "${{ inputs.session_num }}"
+        $hours_start = ($session - 1) * 6 + 1
+        $hours_end   = $session * 6
+
+        Write-Host ""
+        Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "║         WINDOWS CLOUD RDP - EXTENDED             ║" -ForegroundColor Cyan
+        Write-Host "╠══════════════════════════════════════════════════╣" -ForegroundColor Cyan
+        Write-Host "║  Session    : $session of 6                              ║" -ForegroundColor Cyan
+        Write-Host "║  Hours      : $hours_start - $hours_end of total runtime            ║" -ForegroundColor Cyan
+        Write-Host "║  Started    : $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') UTC    ║" -ForegroundColor Cyan
+        Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "System Info:" -ForegroundColor Yellow
+        Write-Host "  OS      : $((Get-WmiObject Win32_OperatingSystem).Caption)"
+        Write-Host "  CPU     : $((Get-WmiObject Win32_Processor).Name)"
+        Write-Host "  RAM     : $([math]::Round((Get-WmiObject Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2)) GB"
+        Write-Host "  Disk    : $([math]::Round((Get-PSDrive C).Free / 1GB, 2)) GB free"
+        Write-Host ""
+
+    # ──────────────────────────────────────
+    - name: 🖥️ Enable Remote Desktop
+    # ──────────────────────────────────────
+      shell: pwsh
+      run: |
+        Write-Host "[*] Enabling Remote Desktop..." -ForegroundColor Cyan
+
+        # Enable RDP
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+          -Name "fDenyTSConnections" -Value 0
+
+        # Disable NLA
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+          -Name "UserAuthentication" -Value 0
+
+        # Allow multiple sessions
+        Set-ItemProperty `
+          -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+          -Name "fSingleSessionPerUser" -Value 0
+
+        # Enable firewall
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+        Write-Host "[✓] Remote Desktop ENABLED" -ForegroundColor Green
+
+    # ──────────────────────────────────────
+    - name: 👤 Create Admin User
+    # ──────────────────────────────────────
+      shell: pwsh
+      env:
+        RDP_PASSWORD: ${{ inputs.rdp_password }}
+        RDP_USERNAME: ${{ inputs.username }}
+      run: |
+        echo "::add-mask::$Env:RDP_PASSWORD"
+
+        Write-Host "[*] Setting up user account..." -ForegroundColor Cyan
+
+        $username = $Env:RDP_USERNAME
+        $password = $Env:RDP_PASSWORD
+        $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+        # Create or update user
+        $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+
+        if ($existing) {
+          Set-LocalUser -Name $username -Password $securePass
+          Write-Host "[✓] User password updated" -ForegroundColor Green
+        } else {
+          New-LocalUser `
+            -Name $username `
+            -Password $securePass `
+            -FullName "Cloud RDP Admin" `
+            -PasswordNeverExpires
+          Write-Host "[✓] User created" -ForegroundColor Green
+        }
+
+        # Add to groups
+        Add-LocalGroupMember -Group "Administrators" `
+          -Member $username -ErrorAction SilentlyContinue
+        Add-LocalGroupMember -Group "Remote Desktop Users" `
+          -Member $username -ErrorAction SilentlyContinue
+
+        # Update runner admin too
+        net user runneradmin $password 2>$null
+
+        Write-Host "[✓] User configured successfully" -ForegroundColor Green
+
+    # ──────────────────────────────────────
+    - name: 📦 Install Chocolatey & Tools
+    # ──────────────────────────────────────
+      shell: pwsh
+      run: |
+        Write-Host "[*] Installing Chocolatey..." -ForegroundColor Cyan
+
+        Set-ExecutionPolicy Bypass -Scope Process -Force
+        [System.Net.ServicePointManager]::SecurityProtocol = `
+          [System.Net.ServicePointManager]::SecurityProtocol -bor 3072
+
+        try {
+          iex ((New-Object System.Net.WebClient).DownloadString(
+            'https://community.chocolatey.org/install.ps1'
+          ))
+          Write-Host "[✓] Chocolatey installed" -ForegroundColor Green
+        } catch {
+          Write-Host "[!] Chocolatey install failed, skipping tools" -ForegroundColor Yellow
+        }
+
+        # Install useful tools
+        $tools = @(
+          "googlechrome",
+          "vscode",
+          "git",
+          "7zip",
+          "notepadplusplus",
+          "python"
+        )
+
+        Write-Host "[*] Installing tools..." -ForegroundColor Cyan
+        foreach ($tool in $tools) {
+          try {
+            choco install $tool -y --no-progress 2>$null
+            Write-Host "  [✓] $tool installed" -ForegroundColor Green
+          } catch {
+            Write-Host "  [!] $tool failed" -ForegroundColor Yellow
+          }
+        }
+
+    # ──────────────────────────────────────
+    - name: 🌐 Install & Connect Tailscale
+    # ──────────────────────────────────────
+      shell: pwsh
+      env:
+        TAILSCALE_AUTHKEY: ${{ inputs.tailscale_authkey }}
+      run: |
+        echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+
+        Write-Host "[*] Setting up Tailscale..." -ForegroundColor Cyan
+
+        $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
+        $isInstalled = Test-Path $tailscale
+
+        if (-not $isInstalled) {
+          # Download
+          $msi = "$Env:TEMP\tailscale.msi"
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile $msi -UseBasicParsing
+
+          # Install
+          Start-Process msiexec `
+            -ArgumentList "/i $msi /quiet /norestart" `
+            -Wait
+          Write-Host "[✓] Tailscale installed" -ForegroundColor Green
+        } else {
+          Write-Host "[✓] Tailscale already installed" -ForegroundColor Green
+        }
+
+        Start-Sleep -Seconds 5
+
+        # Connect with session-specific hostname
+        $session  = "${{ inputs.session_num }}"
+        $hostname = "${{ inputs.hostname }}-s${session}-${{ github.run_id }}"
+
+        & $tailscale up `
+          --authkey="$Env:TAILSCALE_AUTHKEY" `
+          --hostname="$hostname" `
+          --shields-up=false `
+          --accept-routes
+
+        # Wait for connection
+        $maxAttempts = 30
+        for ($i = 0; $i -lt $maxAttempts; $i++) {
+          Start-Sleep -Seconds 2
+          try {
+            $status = & $tailscale status --json | ConvertFrom-Json
+            if ($status.BackendState -eq "Running") {
+              Write-Host "[✓] Tailscale connected!" -ForegroundColor Green
+              break
+            }
+          } catch {}
+          Write-Host "  Connecting... attempt $($i+1)/$maxAttempts" -ForegroundColor Gray
+        }
+
+        # Get IP
+        $ts_ip = & $tailscale ip -4
+        echo "TAILSCALE_IP=$ts_ip" >> $Env:GITHUB_ENV
+
+        Write-Host "[✓] Tailscale IP: $ts_ip" -ForegroundColor Green
+
+    # ──────────────────────────────────────
+    - name: 📋 Connection Info
+    # ──────────────────────────────────────
+      shell: pwsh
+      env:
+        RDP_USERNAME: ${{ inputs.username }}
+      run: |
+        $session     = "${{ inputs.session_num }}"
+        $expire      = (Get-Date).AddHours(6)
+        $ts_ip       = $Env:TAILSCALE_IP
+
+        Write-Host ""
+        Write-Host "╔══════════════════════════════════════════════════════╗" -ForegroundColor Green
+        Write-Host "║          ✅ RDP SESSION $session IS READY!                  ║" -ForegroundColor Green
+        Write-Host "╠══════════════════════════════════════════════════════╣" -ForegroundColor Green
+        Write-Host "║                                                      ║" -ForegroundColor Green
+        Write-Host "║  🌐 Tailscale IP  : $ts_ip" -ForegroundColor Yellow
+        Write-Host "║  👤 Username      : $Env:RDP_USERNAME" -ForegroundColor Yellow
+        Write-Host "║  🔑 Password      : [From RDP_PASSWORD Secret]       ║" -ForegroundColor Yellow
+        Write-Host "║                                                      ║" -ForegroundColor Green
+        Write-Host "║  💻 Windows  →  mstsc /v:$ts_ip" -ForegroundColor Cyan
+        Write-Host "║  🍎 Mac      →  Microsoft Remote Desktop app         ║" -ForegroundColor Cyan
+        Write-Host "║  🐧 Linux    →  xfreerdp /v:$ts_ip /u:$Env:RDP_USERNAME" -ForegroundColor Cyan
+        Write-Host "║                                                      ║" -ForegroundColor Green
+        Write-Host "║  ⏱️  Session    : $session / 6                               ║" -ForegroundColor Magenta
+        Write-Host "║  ⏰ Expires At : $($expire.ToString('HH:mm:ss')) UTC                   ║" -ForegroundColor Magenta
+        Write-Host "╚══════════════════════════════════════════════════════╝" -ForegroundColor Green
+        Write-Host ""
+
+    # ──────────────────────────────────────
+    - name: ⏳ Keep Session Alive (6 Hours)
+    # ──────────────────────────────────────
+      shell: pwsh
+      env:
+        TAILSCALE_AUTHKEY: ${{ inputs.tailscale_authkey }}
+      run: |
+        echo "::add-mask::$Env:TAILSCALE_AUTHKEY"
+
+        $tailscale    = "C:\Program Files\Tailscale\tailscale.exe"
+        $totalMinutes = 355  # Slightly under 360 to avoid timeout
+        $session      = "${{ inputs.session_num }}"
+        $startTime    = Get-Date
+
+        Write-Host "[*] Session $session running for $totalMinutes minutes..." -ForegroundColor Cyan
+        Write-Host ""
+
+        for ($i = 1; $i -le $totalMinutes; $i++) {
+          Start-Sleep -Seconds 60
+
+          $elapsed   = $i
+          $remaining = $totalMinutes - $i
+          $percent   = [math]::Round(($i / $totalMinutes) * 100)
+
+          # Progress bar
+          $filled = [math]::Round($percent / 5)
+          $empty  = 20 - $filled
+          $bar    = ("█" * $filled) + ("░" * $empty)
+
+          Write-Host "  Session $session | [$bar] $percent% | ${elapsed}m elapsed | ${remaining}m left" `
+            -ForegroundColor Cyan
+
+          # Every 15 min - health check
+          if ($i % 15 -eq 0) {
+            Write-Host ""
+            Write-Host "  ── Health Check ──────────────────────────" -ForegroundColor Gray
+
+            # Check Tailscale
+            try {
+              $status = & $tailscale status --json | ConvertFrom-Json
+              if ($status.BackendState -eq "Running") {
+                $ts_ip = & $tailscale ip -4
+                Write-Host "  [✓] Tailscale : Connected ($ts_ip)" -ForegroundColor Green
+              } else {
+                Write-Host "  [!] Tailscale : Reconnecting..." -ForegroundColor Yellow
+                & $tailscale up --authkey="$Env:TAILSCALE_AUTHKEY" --shields-up=false
+              }
+            } catch {
+              Write-Host "  [!] Tailscale check failed" -ForegroundColor Yellow
+            }
+
+            # Check RDP service
+            $svc = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+            if ($svc.Status -eq "Running") {
+              Write-Host "  [✓] RDP Service: Running" -ForegroundColor Green
+            } else {
+              Write-Host "  [!] RDP Service: Restarting..." -ForegroundColor Yellow
+              Start-Service -Name "TermService" -ErrorAction SilentlyContinue
+            }
+
+            # System stats
+            $cpu  = (Get-WmiObject Win32_Processor).LoadPercentage
+            $ram  = [math]::Round((Get-WmiObject Win32_OperatingSystem).FreePhysicalMemory / 1MB, 1)
+            $disk = [math]::Round((Get-PSDrive C).Free / 1GB, 1)
+
+            Write-Host "  [📊] CPU: $cpu% | RAM Free: ${ram}GB | Disk Free: ${disk}GB" -ForegroundColor Gray
+            Write-Host "  ──────────────────────────────────────────" -ForegroundColor Gray
+            Write-Host ""
+          }
+
+          # Warning 15 min before end
+          if ($remaining -eq 15) {
+            Write-Host ""
+            Write-Host "  ⚠️  WARNING: Session $session ends in 15 minutes!" -ForegroundColor Red
+            if ("$session" -ne "6") {
+              Write-Host "  ➡️  Next session will start automatically" -ForegroundColor Yellow
+            } else {
+              Write-Host "  🏁 This is the FINAL session" -ForegroundColor Red
+            }
+            Write-Host ""
+          }
+        }
+
+        Write-Host ""
+        Write-Host "[✓] Session $session complete!" -ForegroundColor Green
+        Write-Host ""
