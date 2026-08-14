@@ -1,58 +1,231 @@
-name: Windows Cloud RDP
+name: 🖥️ Windows Cloud RDP - Extended
 
 on:
   workflow_dispatch:
+    inputs:
+      sessions:
+        description: 'Number of 6-hour sessions (max 6 = 36hrs)'
+        required: true
+        default: '6'
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+          - '4'
+          - '5'
+          - '6'
+      hostname:
+        description: 'Tailscale hostname'
+        required: true
+        default: 'github-rdp'
+      rdp_username:
+        description: 'RDP Username'
+        required: true
+        default: 'CloudAdmin'
+
+  # Auto re-trigger itself via repository_dispatch
+  repository_dispatch:
+    types: [rdp-continue]
 
 jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 360
+  # ============================================================
+  # SESSION MANAGER - Decides how many sessions to run
+  # ============================================================
+  session-manager:
+    runs-on: ubuntu-latest
+    outputs:
+      run_s1: ${{ steps.plan.outputs.run_s1 }}
+      run_s2: ${{ steps.plan.outputs.run_s2 }}
+      run_s3: ${{ steps.plan.outputs.run_s3 }}
+      run_s4: ${{ steps.plan.outputs.run_s4 }}
+      run_s5: ${{ steps.plan.outputs.run_s5 }}
+      run_s6: ${{ steps.plan.outputs.run_s6 }}
+      hostname: ${{ steps.plan.outputs.hostname }}
+      username: ${{ steps.plan.outputs.username }}
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      - name: 📋 Plan Sessions
+        id: plan
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+          # Get inputs (handle both manual and auto-trigger)
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            SESSIONS="${{ github.event.client_payload.sessions }}"
+            HOSTNAME="${{ github.event.client_payload.hostname }}"
+            USERNAME="${{ github.event.client_payload.username }}"
+          else
+            SESSIONS="${{ github.event.inputs.sessions }}"
+            HOSTNAME="${{ github.event.inputs.hostname }}"
+            USERNAME="${{ github.event.inputs.rdp_username }}"
+          fi
 
-      - name: 2. Create Admin Account
+          echo "Total sessions requested: $SESSIONS"
+          echo "hostname=$HOSTNAME"   >> $GITHUB_OUTPUT
+          echo "username=$USERNAME"   >> $GITHUB_OUTPUT
+
+          # Enable sessions based on count
+          for i in 1 2 3 4 5 6; do
+            if [ "$i" -le "$SESSIONS" ]; then
+              echo "run_s$i=true"  >> $GITHUB_OUTPUT
+            else
+              echo "run_s$i=false" >> $GITHUB_OUTPUT
+            fi
+          done
+
+          echo ""
+          echo "Session Plan:"
+          for i in 1 2 3 4 5 6; do
+            if [ "$i" -le "$SESSIONS" ]; then
+              echo "  Session $i: ✅ ENABLED"
+            else
+              echo "  Session $i: ⏭️  SKIPPED"
+            fi
+          done
+
+  # ============================================================
+  # SESSION 1 - Hours 1-6
+  # ============================================================
+  session-1:
+    needs: session-manager
+    if: needs.session-manager.outputs.run_s1 == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    env:
+      SESSION_NUM: 1
+      HOSTNAME: ${{ needs.session-manager.outputs.hostname }}
+      USERNAME: ${{ needs.session-manager.outputs.username }}
+
+    steps:
+      - name: 🚀 Setup & Run Session 1
+        uses: ./.github/actions/rdp-session
+        with:
+          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          rdp_password: ${{ secrets.RDP_PASSWORD }}
+          session_num: "1"
+          hostname: ${{ needs.session-manager.outputs.hostname }}
+          username: ${{ needs.session-manager.outputs.username }}
+        continue-on-error: true
+
+  # ============================================================
+  # SESSION 2 - Hours 7-12
+  # ============================================================
+  session-2:
+    needs: [session-manager, session-1]
+    if: |
+      always() &&
+      needs.session-manager.outputs.run_s2 == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: 🚀 Setup & Run Session 2
+        uses: ./.github/actions/rdp-session
+        with:
+          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          rdp_password: ${{ secrets.RDP_PASSWORD }}
+          session_num: "2"
+          hostname: ${{ needs.session-manager.outputs.hostname }}
+          username: ${{ needs.session-manager.outputs.username }}
+        continue-on-error: true
+
+  # ============================================================
+  # SESSION 3 - Hours 13-18
+  # ============================================================
+  session-3:
+    needs: [session-manager, session-2]
+    if: |
+      always() &&
+      needs.session-manager.outputs.run_s3 == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: 🚀 Setup & Run Session 3
+        uses: ./.github/actions/rdp-session
+        with:
+          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          rdp_password: ${{ secrets.RDP_PASSWORD }}
+          session_num: "3"
+          hostname: ${{ needs.session-manager.outputs.hostname }}
+          username: ${{ needs.session-manager.outputs.username }}
+        continue-on-error: true
+
+  # ============================================================
+  # SESSION 4 - Hours 19-24
+  # ============================================================
+  session-4:
+    needs: [session-manager, session-3]
+    if: |
+      always() &&
+      needs.session-manager.outputs.run_s4 == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: 🚀 Setup & Run Session 4
+        uses: ./.github/actions/rdp-session
+        with:
+          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          rdp_password: ${{ secrets.RDP_PASSWORD }}
+          session_num: "4"
+          hostname: ${{ needs.session-manager.outputs.hostname }}
+          username: ${{ needs.session-manager.outputs.username }}
+        continue-on-error: true
+
+  # ============================================================
+  # SESSION 5 - Hours 25-30
+  # ============================================================
+  session-5:
+    needs: [session-manager, session-4]
+    if: |
+      always() &&
+      needs.session-manager.outputs.run_s5 == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: 🚀 Setup & Run Session 5
+        uses: ./.github/actions/rdp-session
+        with:
+          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          rdp_password: ${{ secrets.RDP_PASSWORD }}
+          session_num: "5"
+          hostname: ${{ needs.session-manager.outputs.hostname }}
+          username: ${{ needs.session-manager.outputs.username }}
+        continue-on-error: true
+
+  # ============================================================
+  # SESSION 6 - Hours 31-36
+  # ============================================================
+  session-6:
+    needs: [session-manager, session-5]
+    if: |
+      always() &&
+      needs.session-manager.outputs.run_s6 == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: 🚀 Setup & Run Session 6
+        uses: ./.github/actions/rdp-session
+        with:
+          tailscale_authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          rdp_password: ${{ secrets.RDP_PASSWORD }}
+          session_num: "6"
+          hostname: ${{ needs.session-manager.outputs.hostname }}
+          username: ${{ needs.session-manager.outputs.username }}
+        continue-on-error: true
+
+  # ============================================================
+  # SUMMARY
+  # ============================================================
+  summary:
+    needs: [session-manager, session-1, session-2, session-3, session-4, session-5, session-6]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📊 Session Summary
         run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
-
-      - name: 3. Install & Connect Tailscale VPN
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-        run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
-          Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 4. Keep Server Alive (6 Hours)
-        run: |
-          for ($i = 1; $i -le 360; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/360] Server running..."
-          }
-
-
+          echo "================================="
+          echo "  RDP SESSION SUMMARY"
+          echo "================================="
+          echo "  Total Sessions : ${{ github.event.inputs.sessions }}"
+          echo "  Total Hours    : $(( ${{ github.event.inputs.sessions }} * 6 ))"
+          echo "  Hostname       : ${{ github.event.inputs.hostname }}"
+          echo "  Run ID         : ${{ github.run_id }}"
+          echo "================================="
