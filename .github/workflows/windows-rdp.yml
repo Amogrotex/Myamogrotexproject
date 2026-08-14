@@ -1,312 +1,57 @@
-# =============================================================================
-#  Windows Cloud RDP — Improved & hardened
-#
-#  What it does:
-#    Spins up a temporary Windows VM on GitHub Actions, enables Remote Desktop,
-#    joins it to your Tailscale network, and keeps it alive up to 6 hours so you
-#    can connect from anywhere with mstsc / Microsoft Remote Desktop.
-#
-#  What was fixed vs. the typical "free RDP" template:
-#    * Password is NEVER hardcoded or printed — you type it in the "Run
-#      workflow" dialog and it is masked everywhere (::add-mask::).
-#    * NLA (Network Level Authentication) stays ENABLED for security.
-#    * Tailscale is downloaded with curl.exe + TLS 1.2 + retries -> fixes
-#      HTTP 426 "Upgrade Required" from the Tailscale CDN.
-#    * `tailscale up` is retried until it actually joins the tailnet, then we
-#      wait for a real 100.x IPv4 address instead of blind Start-Sleep calls.
-#    * RDP port 3389 is verified listening before we report success.
-#    * Connection info also lands in the run summary (Actions tab).
-#    * Configurable username / password / lifetime / node hostname.
-#    * Fails fast with a clear message if TAILSCALE_AUTHKEY is missing.
-#    * Minimal permissions + concurrency guard (one server at a time).
-#
-#  Before you run it (one-time setup):
-#    1) Create a Tailscale auth key at https://login.tailscale.com/admin/settings/keys
-#       -> preferably EPHEMERAL, tagged with something like tag:github-rdp,
-#          so the node is removed from your tailnet automatically.
-#    2) Add it as a repository secret named TAILSCALE_AUTHKEY:
-#       repo Settings > Secrets and variables > Actions > New repository secret.
-#    3) Keep the repo PRIVATE. In a public repo anyone could trigger a run and
-#       burn your Tailnet key / minutes.
-# =============================================================================
-
-name: Windows Cloud RDP (Improved)
-
-run-name: RDP server — ${{ inputs.hostname || 'auto' }} (${{ github.actor }})
+name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      username:
-        description: 'Local admin username for RDP'
-        required: false
-        default: 'CynetAdmin'
-        type: string
-      password:
-        description: 'RDP password (typed here, masked in logs — never hardcode one in the file)'
-        required: true
-        default: ''
-        type: string
-      hours:
-        description: 'How many hours to keep the server alive (1–6)'
-        required: false
-        default: '6'
-        type: string
-      hostname:
-        description: 'Tailscale node hostname (empty = auto: github-rdp-<run id>)'
-        required: false
-        default: ''
-        type: string
-
-permissions:
-  contents: read
-
-concurrency:
-  group: windows-rdp
-  cancel-in-progress: false
 
 jobs:
-  rdp:
-    name: Spawn & keep alive
+  build:
     runs-on: windows-latest
     timeout-minutes: 360
 
     steps:
-      - name: Validate inputs & secrets
-        shell: pwsh
+      - name: 1. Enable Remote Desktop & Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+      - name: 2. Create Admin Account
+        run: |
+          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
+          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Cynet@2026
+
+      - name: 3. Install & Connect Tailscale VPN
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          RDP_PASSWORD: ${{ inputs.password }}
-          RDP_HOURS: ${{ inputs.hours }}
         run: |
-          # Mask the password immediately so it can never appear in raw logs
-          Write-Output "::add-mask::$env:RDP_PASSWORD"
+          # Download and install Tailscale silently
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          
+          # Connect to Tailscale network
+          Start-Sleep -Seconds 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          
+          Start-Sleep -Seconds 8
+          
+          # Get Tailscale IP
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
 
-          # --- Tailscale auth key ---------------------------------------------------
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
-            Write-Error "TAILSCALE_AUTHKEY secret is not set.`nAdd it: repo Settings > Secrets and variables > Actions > New repository secret.`nGet a key: https://login.tailscale.com/admin/settings/keys"
-            exit 1
-          }
-          if (-not $env:TAILSCALE_AUTHKEY.StartsWith('tskey-')) {
-            Write-Warning "TAILSCALE_AUTHKEY does not look like a Tailscale key (expected 'tskey-...'). Continuing anyway."
-          }
-          # --- Password ---------------------------------------------------------------
-          # GitHub runner local policy requires: >= 8 chars AND >= 3 of 4 classes
-          # (upper, lower, digit, special). Checked here so you get a clear message
-          # instead of New-LocalUser's cryptic InvalidPasswordException.
-          $pw = $env:RDP_PASSWORD
-          if ([string]::IsNullOrWhiteSpace($pw)) {
-            Write-Error "No password supplied. Open Actions > 'Windows Cloud RDP (Improved)' > Run workflow and type a password."
-            exit 1
-          }
-          $classes = 0
-          if ($pw -cmatch '[A-Z]') { $classes++ }
-          if ($pw -cmatch '[a-z]') { $classes++ }
-          if ($pw -cmatch '[0-9]') { $classes++ }
-          if ($pw -cmatch '[^A-Za-z0-9]') { $classes++ }
-          if ($pw.Length -lt 8 -or $classes -lt 3) {
-            Write-Error "The RDP password must be at least 8 characters and include at least 3 of: uppercase letter, lowercase letter, digit, special character (Windows password policy). Current: len=$($pw.Length), classes=$classes."
-            exit 1
-          }
-          # --- Hours -------------------------------------------------------------------
-          $hours = [int]$env:RDP_HOURS
-          if ($hours -lt 1 -or $hours -gt 6) {
-            Write-Error "hours must be between 1 and 6 (got: $hours)."
-            exit 1
-          }
-          Write-Host "Configuration OK. Lifetime: $hours h. Password meets policy and is masked."
-
-      - name: 1. Enable Remote Desktop & firewall
-        shell: pwsh
+      - name: 4. Keep Server Alive (6 Hours)
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0
-          # Keep NLA ON (1) — the original disabled it; leaving it on is safer
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 1
-          if (-not (Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName 'RDP 3389' -Direction Inbound -LocalPort 3389 -Protocol TCP -Action Allow
-          } else {
-            Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
-          }
-          Write-Host 'Remote Desktop enabled.'
-
-      - name: 2. Create local admin account (net.exe — avoids New-LocalUser flakiness)
-        shell: pwsh
-        env:
-          RDP_USERNAME: ${{ inputs.username }}
-          RDP_PASSWORD: ${{ inputs.password }}
-        run: |
-          # Mask the password so it can never appear in raw logs
-          Write-Output "::add-mask::$env:RDP_PASSWORD"
-
-          $u  = $env:RDP_USERNAME
-          $pw = $env:RDP_PASSWORD
-
-          # GitHub windows runners always ship a built-in local admin: runneradmin.
-          # Reset its password so RDP logon works even with the default account.
-          & net.exe user runneradmin $pw | Out-Null
-          if ($LASTEXITCODE -ne 0) {
-            Write-Warning "Could not reset password for 'runneradmin' (exit $LASTEXITCODE) — continuing."
-          }
-
-          # Does the requested account already exist?
-          # (kept deliberately simple — inline `2>$null; $LASTEXITCODE` inside
-          #  parens triggers a PowerShell parser bug: "Missing closing ')'")
-          & net.exe user $u | Out-Null
-          $exists = ($LASTEXITCODE -eq 0)
-
-          if ($u -eq 'runneradmin') {
-            Write-Host "'runneradmin' password was reset above — nothing else to create."
-          } elseif ($exists) {
-            # Existing user -> just reset the password
-            & net.exe user $u $pw | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "net user failed to reset password for '$u' (exit $LASTEXITCODE)."
-              exit 1
-            }
-            Write-Host "User '$u' already exists — password updated."
-          } else {
-            # New user -> create with net.exe, never expires
-            & net.exe user $u $pw /add /expires:never | Out-Null
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "net user /add failed for '$u' (exit $LASTEXITCODE)."
-              exit 1
-            }
-            Write-Host "User '$u' created."
-          }
-
-          # Make it a local administrator
-          & net.exe localgroup Administrators $u /add | Out-Null
-          if ($LASTEXITCODE -eq 2) {
-            # net.exe returns 2 when the account is already a member
-            Write-Host "'$u' is already a local administrator."
-          } elseif ($LASTEXITCODE -ne 0) {
-            Write-Warning "Could not add '$u' to Administrators (exit $LASTEXITCODE) — RDP may fail to log on."
-          } else {
-            Write-Host "'$u' is now a local administrator."
-          }
-
-      - name: 3. Install Tailscale (curl + TLS 1.2 — avoids HTTP 426)
-        shell: pwsh
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-          $msi = Join-Path $env:TEMP 'tailscale.msi'
-          curl.exe -L --retry 5 --retry-delay 3 --connect-timeout 30 `
-            -o $msi 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
-          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $msi)) {
-            Write-Error 'Failed to download the Tailscale MSI (network/proxy? TLS?).'
-            exit 1
-          }
-
-          Start-Process msiexec -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-          Write-Host 'Tailscale installed.'
-
-          # Locate the binary (it can live under Program Files or Program Files (x86))
-          $ts = Get-ChildItem $env:ProgramFiles, ${env:ProgramFiles(x86)} `
-                -Filter tailscale.exe -Recurse -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-          if (-not $ts) {
-            Write-Error 'tailscale.exe not found after install.'
-            exit 1
-          }
-          Write-Output "ts_exe=$($ts.FullName)" >> $env:GITHUB_ENV
-          Write-Host "Found tailscale at: $($ts.FullName)"
-
-      - name: 4. Join the Tailscale network
-        shell: pwsh
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
-          TS_HOSTNAME: ${{ inputs.hostname }}
-        run: |
-          $ts = $env:TS_EXE
-
-          $hostname = if ([string]::IsNullOrWhiteSpace($env:TS_HOSTNAME)) {
-            "github-rdp-$($env:GITHUB_RUN_ID)"
-          } else {
-            ($env:TS_HOSTNAME -replace '\s+', '-')
-          }
-          Write-Host "Connecting as node: $hostname"
-
-          # Retry until it actually joins (no blind sleeps)
-          $up = $false
-          for ($i = 1; $i -le 10; $i++) {
-            & $ts up "--authkey=$env:TAILSCALE_AUTHKEY" "--hostname=$hostname"
-            if ($LASTEXITCODE -eq 0) { $up = $true; break }
-            Write-Host "tailscale up attempt $i/10 failed, retrying in 5s..."
-            Start-Sleep -Seconds 5
-          }
-          if (-not $up) { Write-Error 'tailscale up failed after 10 attempts.'; exit 1 }
-
-          # Wait until the daemon reports a real 100.x IPv4 address
-          $ip = $null
-          for ($i = 1; $i -le 12; $i++) {
-            Start-Sleep -Seconds 5
-            $ip = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if ($ip) { break }
-          }
-          if (-not $ip) { Write-Error 'Could not obtain a Tailscale IPv4 address.'; exit 1 }
-
-          Write-Output "ts_ip=$ip" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IPv4: $ip"
-          & $ts status
-
-      - name: 5. Verify RDP is listening
-        shell: pwsh
-        run: |
-          $ok = Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -WarningAction SilentlyContinue
-          if ($ok.TcpTestSucceeded) {
-            Write-Host 'RDP is listening on 3389 — good to go.'
-          } else {
-            Write-Warning 'Port 3389 did not respond yet — the service may still be starting. Connection info will still be printed below.'
-          }
-
-      - name: 6. Print connection info + write run summary
-        shell: pwsh
-        env:
-          RDP_USERNAME: ${{ inputs.username }}
-          RDP_HOURS: ${{ inputs.hours }}
-        run: |
-          $ip = $env:TS_IP
-          $u  = $env:RDP_USERNAME
-
-          Write-Host ''
-          Write-Host '==================================================' -ForegroundColor Green
-          Write-Host '  >>> RDP SERVER IS READY! <<<' -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ip" -ForegroundColor Yellow
-          Write-Host "  Username     : $u" -ForegroundColor Yellow
-          Write-Host '  Password     : (the one you entered — masked, never printed)' -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ip" -ForegroundColor Magenta
-          Write-Host '==================================================' -ForegroundColor Green
-
-          $summary = @"
-          ## 🖥️ RDP server is ready
-          | Field | Value |
-          |---|---|
-          | **Tailscale IP** | $ip |
-          | **Username** | $u |
-          | **Password** | the one you typed when starting the run (masked — never printed or stored) |
-          | **Connect with** | mstsc (Windows) / Microsoft Remote Desktop (macOS, iOS, Android) |
-          | **Lifetime** | $($env:RDP_HOURS) h from start, then the VM is destroyed |
-
-          > ⚠️ This is a **temporary, disposable** VM. Anything you put on it is lost when the
-          > run ends. Don't store sensitive data on it, and log off / run again when done.
-          "@
-          $summary >> $env:GITHUB_STEP_SUMMARY
-
-      - name: 7. Keep the server alive
-        shell: pwsh
-        env:
-          RDP_HOURS: ${{ inputs.hours }}
-        run: |
-          $minutes = [int]$env:RDP_HOURS * 60
-          Write-Host "Keeping the runner alive for $($env:RDP_HOURS) h ($minutes min)."
-          $i = 0
-          while ($i -lt $minutes) {
-            if ($i % 10 -eq 0) {
-              Write-Host "[heartbeat] ${i}m / ${minutes}m — RDP still up at $(Get-Date -Format 'HH:mm:ss')"
-            }
+          for ($i = 1; $i -le 360; $i++) {
             Start-Sleep -Seconds 60
-            $i++
+            Write-Host "[$i/360] Server running..."
           }
-          Write-Host 'Lifetime reached — run finished, the VM is being destroyed.'
+
