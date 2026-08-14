@@ -149,7 +149,10 @@ jobs:
           }
 
           # Does the requested account already exist?
-          $exists = (& net.exe user $u 2>$null; $LASTEXITCODE -eq 0)
+          # (kept deliberately simple — inline `2>$null; $LASTEXITCODE` inside
+          #  parens triggers a PowerShell parser bug: "Missing closing ')'")
+          & net.exe user $u | Out-Null
+          $exists = ($LASTEXITCODE -eq 0)
 
           if ($u -eq 'runneradmin') {
             Write-Host "'runneradmin' password was reset above — nothing else to create."
