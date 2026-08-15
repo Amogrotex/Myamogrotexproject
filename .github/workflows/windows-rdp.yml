@@ -39,9 +39,14 @@ jobs:
           Invoke-WebRequest "https://localtonet.com/download/localtonet-win-64.zip" -OutFile "C:\localtonet.zip"
           Expand-Archive "C:\localtonet.zip" -DestinationPath "C:\localtonet" -Force
 
-          # احراز هویت و نصب به‌صورت سرویس ویندوز (در پس‌زمینه، بدون بلاک شدن مرحله)
-          & "C:\localtonet\localtonet.exe" --install-service --authtoken "$Env:LOCALTONET_AUTHTOKEN"
-          & "C:\localtonet\localtonet.exe" --start-service --authtoken "$Env:LOCALTONET_AUTHTOKEN"
+          # اجرای کلاینت به‌صورت جدا از مرحله (پنجره مخفی، بدون بلاک کردن)
+          # نکته: از -NoNewWindow استفاده نمی‌کنیم چون باعث فریز شدن مرحله می‌شود
+          $args = "--authtoken `"$Env:LOCALTONET_AUTHTOKEN`""
+          Start-Process -FilePath "C:\localtonet\localtonet.exe" `
+            -ArgumentList $args `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput "C:\localtonet\out.log" `
+            -RedirectStandardError "C:\localtonet\err.log"
 
           Start-Sleep -Seconds 15
 
@@ -54,6 +59,9 @@ jobs:
           Write-Host "      public address (e.g. 8o4v6zsgam.localto.net:PORT)." -ForegroundColor Magenta
           Write-Host "      Then run:  mstsc  ->  that address" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
+          Write-Host ""
+          Write-Host "--- localtonet client log (out.log) ---"
+          Get-Content "C:\localtonet\out.log" -ErrorAction SilentlyContinue
 
       # ------------------------------------------------------------------
       # 4) زنده نگه‌داشتن سرور
