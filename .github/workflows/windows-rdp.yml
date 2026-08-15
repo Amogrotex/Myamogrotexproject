@@ -1,58 +1,50 @@
-name: Windows Cloud RDP (Ngrok)
-
-on:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-latest
-    timeout-minutes: 999
-
-    steps:
-      - name: 1. Enable Remote Desktop
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
-
-      - name: 2. Create Admin Account
-        run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
-
       - name: 3. Setup Ngrok Tunnel
         run: |
           # Download Ngrok
           Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "C:\ngrok.zip"
           Expand-Archive "C:\ngrok.zip" -DestinationPath "C:\ngrok"
           
-          # Authenticate using the token you provided
+          # Authenticate
           C:\ngrok\ngrok.exe authtoken "39kfpc4o02bVwjKQxtbomLlO7qF_2KoSwgUzgRKRLzZpRAG4c"
           
           # Start Tunnel
           Start-Process "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
           
-          Start-Sleep -Seconds 10
+          # Wait for ngrok to fully start
+          Write-Host "Waiting for Ngrok to start..."
+          $maxAttempts = 20
+          $attempt = 0
+          $success = $false
           
-          # Get the Tunnel Address
-          $response = Invoke-RestMethod "http://localhost:4040/api/tunnels"
-          $raw_address = $response.tunnels[0].public_url -replace "tcp://", ""
+          while ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds 3
+            $attempt++
+            Write-Host "Attempt $attempt of $maxAttempts..."
+            
+            try {
+              $response = Invoke-RestMethod "http://localhost:4040/api/tunnels" -ErrorAction Stop
+              if ($response.tunnels.Count -gt 0) {
+                $success = $true
+                break
+              }
+            } catch {
+              Write-Host "API not ready yet, retrying..."
+            }
+          }
           
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  ADDRESS  : $raw_address" -ForegroundColor Yellow
-          Write-Host "  USERNAME : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  PASSWORD : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  Copy '$raw_address' into your Android RDP App"
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 4. Keep Alive
-        run: |
-          for ($i = 1; $i -le 999; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/999] Server running..."
+          if ($success) {
+            $raw_address = $response.tunnels[0].public_url -replace "tcp://", ""
+            
+            Write-Host ""
+            Write-Host "==================================================" -ForegroundColor Green
+            Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+            Write-Host "  ADDRESS  : $raw_address" -ForegroundColor Yellow
+            Write-Host "  USERNAME : CynetAdmin" -ForegroundColor Yellow
+            Write-Host "  PASSWORD : Cynet@2026" -ForegroundColor Yellow
+            Write-Host "==================================================" -ForegroundColor Green
+          } else {
+            Write-Host "Ngrok failed to start!" -ForegroundColor Red
+            # Show ngrok process status
+            Get-Process ngrok -ErrorAction SilentlyContinue
+            exit 1
           }
