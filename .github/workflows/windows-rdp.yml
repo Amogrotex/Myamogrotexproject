@@ -1,4 +1,4 @@
-name: Windows Cloud RDP
+name: Windows Cloud RDP (Ngrok)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,7 @@ jobs:
     timeout-minutes: 999
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      - name: 1. Enable Remote Desktop
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
@@ -22,37 +22,37 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
 
-      - name: 3. Install & Connect Tailscale VPN
-        env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      - name: 3. Setup Ngrok Tunnel
         run: |
-          # Download and install Tailscale silently
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          # Download Ngrok
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "C:\ngrok.zip"
+          Expand-Archive "C:\ngrok.zip" -DestinationPath "C:\ngrok"
           
-          # Connect to Tailscale network
-          Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          # Authenticate using the token you provided
+          C:\ngrok\ngrok.exe authtoken "39kfpc4o02bVwjKQxtbomLlO7qF_2KoSwgUzgRKRLzZpRAG4c"
           
-          Start-Sleep -Seconds 8
+          # Start Tunnel
+          Start-Process "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389" -WindowStyle Hidden
           
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          Start-Sleep -Seconds 10
+          
+          # Get the Tunnel Address
+          $response = Invoke-RestMethod "http://localhost:4040/api/tunnels"
+          $raw_address = $response.tunnels[0].public_url -replace "tcp://", ""
           
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  ADDRESS  : $raw_address" -ForegroundColor Yellow
+          Write-Host "  USERNAME : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  PASSWORD : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  Copy '$raw_address' into your Android RDP App"
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 4. Keep Server Alive (6 Hours)
+      - name: 4. Keep Alive
         run: |
           for ($i = 1; $i -le 999; $i++) {
             Start-Sleep -Seconds 60
             Write-Host "[$i/999] Server running..."
           }
-
-
