@@ -1,120 +1,58 @@
-name: Windows Cloud RDP (Persistent Workspace)
+name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write   # needed so the job can push workspace backups to the repo
 
 jobs:
   build:
     runs-on: windows-latest
     timeout-minutes: 360
 
-    env:
-      WORK_DIR: C:\workspace    # everything inside this folder survives between runs
-      RDP_USER: CynetAdmin      # username
-      RDP_PASS: CynetAdmin      # password = same as username
-
     steps:
-      - name: 1. Enable RDP + create admin (user = password)
+      - name: 1. Enable Remote Desktop & Firewall
         run: |
-          # Allow a simple password (same as username). Windows blocks this by default.
-          secedit /export /cfg C:\secpol.cfg | Out-Null
-          (Get-Content C:\secpol.cfg) -replace 'PasswordComplexity = 1', 'PasswordComplexity = 0' | Set-Content C:\secpol.cfg
-          secedit /configure /db C:\windows\security\local.sdb /cfg C:\secpol.cfg /areas SECURITYPOLICY | Out-Null
-          Remove-Item C:\secpol.cfg -Force -ErrorAction SilentlyContinue
-
-          # Enable RDP + firewall (this enables TCP and UDP 3389 = faster RDP)
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-          # Create the user (works even on re-run, no errors)
-          $pw = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
-          New-LocalUser -Name $env:RDP_USER -Password $pw -PasswordNeverExpires -ErrorAction SilentlyContinue | Out-Null
-          net user $env:RDP_USER $env:RDP_PASS | Out-Null
-          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
-
-      - name: 2. Block surprise restarts (Windows Update)
+      - name: 2. Create Admin Account
         run: |
-          Stop-Service wuauserv -Force -ErrorAction SilentlyContinue
-          Set-Service wuauserv -StartupType Disabled -ErrorAction SilentlyContinue
+          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
+          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Cynet@2026
 
-      - name: 3. Restore workspace from last backup
-        run: |
-          git config --global user.email "bot@localhost"
-          git config --global user.name "backup-bot"
-          New-Item -ItemType Directory -Path "$env:WORK_DIR" -Force | Out-Null
-          $repo = "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          if (git ls-remote --heads $repo workspace-backup) {
-            git clone --depth 1 --branch workspace-backup $repo C:\rdp-backup
-            if (Test-Path "C:\rdp-backup\workspace.zip") {
-              Write-Host "Backup found - restoring your workspace..."
-              Expand-Archive "C:\rdp-backup\workspace.zip" -DestinationPath "$env:WORK_DIR" -Force
-              Write-Host "Restore done."
-            }
-          } else {
-            Write-Host "First run - no backup yet."
-          }
-          exit 0   # restore must never fail the whole run
-
-      - name: 4. Install Tailscale (fast) + connect
+      - name: 3. Install & Connect Tailscale VPN
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # curl.exe is much faster than Invoke-WebRequest on Windows
-          curl.exe -L --retry 3 -sS -o C:\tailscale.msi "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
-          if (!(Test-Path C:\tailscale.msi)) { throw "Tailscale download failed" }
+          # Download and install Tailscale silently
+          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+          
+          # Connect to Tailscale network
+          Start-Sleep -Seconds 5
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
+          
+          Start-Sleep -Seconds 8
+          
+          # Get Tailscale IP
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
 
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          $wait = 0
-          while (!(Test-Path $ts) -and $wait -lt 20) { Start-Sleep 3; $wait++ }
-          if (!(Test-Path $ts)) { throw "Tailscale install failed" }
-
-          & $ts up --authkey="$env:TAILSCALE_AUTHKEY" --hostname="gh-rdp-${{ github.run_number }}" --unattended
-          Start-Sleep 8
-          $ip = & $ts ip -4
-          if (-not $ip) { throw "tailscale up failed - check TAILSCALE_AUTHKEY secret (must be a REUSABLE key)" }
-
-          Write-Host "=================================================="
-          Write-Host "  >>> RDP READY <<<"
-          Write-Host "  Tailscale IP : $ip"
-          Write-Host "  Username     : $env:RDP_USER"
-          Write-Host "  Password     : $env:RDP_PASS   (same as username)"
-          Write-Host "  Save files in: C:\workspace (auto backup)"
-          Write-Host "=================================================="
-
-          # Connection quality info:
-          & $ts status
-          Write-Host "--- netcheck (you want 'UDP: true' for fast speed) ---"
-          & $ts netcheck | Select-Object -First 12
-
-      - name: 5. Keep alive (6h) + auto-backup every 30 min
+      - name: 4. Keep Server Alive (6 Hours)
         run: |
-          $repo = "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           for ($i = 1; $i -le 360; $i++) {
-            Start-Sleep 60
-            Write-Host "[$i/360] running..."
-            if (($i % 30) -eq 0) {   # backup at 30, 60, ... and final at 360
-              try {
-                Write-Host ">>> Backing up workspace..."
-                robocopy "$env:WORK_DIR" C:\stage /MIR /NFL /NDL /NJH /NJS | Out-Null
-                Compress-Archive "C:\stage\*" C:\workspace.zip -Force
-                if (!(Test-Path "C:\rdp-backup\.git")) {
-                  git init C:\rdp-backup | Out-Null
-                  git -C C:\rdp-backup remote add origin $repo
-                }
-                git -C C:\rdp-backup checkout -B workspace-backup | Out-Null
-                Copy-Item C:\workspace.zip C:\rdp-backup\workspace.zip -Force
-                git -C C:\rdp-backup add workspace.zip
-                git -C C:\rdp-backup commit -m "backup minute $i" | Out-Null
-                git -C C:\rdp-backup push -f origin workspace-backup | Out-Null
-                Write-Host ">>> Backup done."
-              } catch {
-                Write-Host "!!! Backup failed: $_"
-              }
-            }
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/360] Server running..."
           }
-          exit 0   # end the run green, not with a random error code
+
+
