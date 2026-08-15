@@ -39,13 +39,9 @@ jobs:
           Invoke-WebRequest "https://localtonet.com/download/localtonet-win-64.zip" -OutFile "C:\localtonet.zip"
           Expand-Archive "C:\localtonet.zip" -DestinationPath "C:\localtonet" -Force
 
-          # احراز هویت کلاینت با AuthToken (که در Secret ذخیره شده)
-          & "C:\localtonet\localtonet.exe" --authtoken "$Env:LOCALTONET_AUTHTOKEN"
-
-          # اجرای کلاینت در پس‌زمینه تا به تونلِ از پیش ساخته‌شده وصل بشه
-          $log = "C:\localtonet\tunnel.log"
-          Start-Process -FilePath "C:\localtonet\localtonet.exe" `
-            -RedirectStandardOutput $log -RedirectStandardError $log -NoNewWindow
+          # احراز هویت و نصب به‌صورت سرویس ویندوز (در پس‌زمینه، بدون بلاک شدن مرحله)
+          & "C:\localtonet\localtonet.exe" --install-service --authtoken "$Env:LOCALTONET_AUTHTOKEN"
+          & "C:\localtonet\localtonet.exe" --start-service --authtoken "$Env:LOCALTONET_AUTHTOKEN"
 
           Start-Sleep -Seconds 15
 
@@ -55,12 +51,9 @@ jobs:
           Write-Host "  Username : CynetAdmin" -ForegroundColor Yellow
           Write-Host "  Password : Cynet@2026" -ForegroundColor Yellow
           Write-Host "  >>> Open your localtonet DASHBOARD to get the" -ForegroundColor Magenta
-          Write-Host "      public address (e.g. us1.localtonet.com:23XXX)." -ForegroundColor Magenta
+          Write-Host "      public address (e.g. 8o4v6zsgam.localto.net:PORT)." -ForegroundColor Magenta
           Write-Host "      Then run:  mstsc  ->  that address" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host ""
-          Write-Host "--- localtonet client log ---"
-          Get-Content $log -ErrorAction SilentlyContinue
 
       # ------------------------------------------------------------------
       # 4) زنده نگه‌داشتن سرور
