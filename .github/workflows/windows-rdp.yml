@@ -33,7 +33,7 @@ jobs:
       RDP_USERNAME: CynetAdmin
       RDP_PASSWORD: Cynet@2026
       NGROK_DIR: C:\ngrok
-      LOG_DIR: ${{ runner.temp }}\rdp-logs
+      LOG_DIR: C:\rdp-logs
 
     defaults:
       run:
