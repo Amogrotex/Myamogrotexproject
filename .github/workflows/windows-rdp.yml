@@ -1,57 +1,87 @@
-      - name: 3. Setup Ngrok Tunnel
-        run: |
-          # Download Ngrok
-          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile "C:\ngrok.zip"
-          Expand-Archive "C:\ngrok.zip" -DestinationPath "C:\ngrok"
-          
-          # Authenticate
-          C:\ngrok\ngrok.exe authtoken "39kfpc4o02bVwjKQxtbomLlO7qF_2KoSwgUzgRKRLzZpRAG4c"
-          
-          # Start Tunnel with log file so we can see errors
-          Start-Process "C:\ngrok\ngrok.exe" -ArgumentList "tcp 3389 --log=C:\ngrok\ngrok.log --log-format=json" -WindowStyle Hidden
-          
-          # Wait and retry
-          Write-Host "Waiting for Ngrok..."
-          $maxAttempts = 30
-          $attempt = 0
-          $success = $false
-          
-          while ($attempt -lt $maxAttempts) {
-            Start-Sleep -Seconds 3
-            $attempt++
-            Write-Host "Attempt $attempt of $maxAttempts..."
-            
-            try {
-              $response = Invoke-RestMethod "http://localhost:4040/api/tunnels" -ErrorAction Stop
-              if ($response.tunnels.Count -gt 0) {
-                $success = $true
-                break
-              }
-            } catch {
-              # Show log to debug
-              if (Test-Path "C:\ngrok\ngrok.log") {
-                Write-Host "--- Ngrok Log ---"
-                Get-Content "C:\ngrok\ngrok.log" | Select-Object -Last 5
-                Write-Host "-----------------"
-              }
-            }
+- name: 3. Diagnose Ngrok startup
+  shell: pwsh
+  env:
+    NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+  run: |
+    $ErrorActionPreference = "Stop"
+
+    if ([string]::IsNullOrWhiteSpace($Env:NGROK_AUTHTOKEN)) {
+      throw "NGROK_AUTHTOKEN GitHub secret is missing"
+    }
+
+    Write-Output "::add-mask::$Env:NGROK_AUTHTOKEN"
+
+    $ngrokDir = "C:\ngrok"
+    $ngrokExe = "$ngrokDir\ngrok.exe"
+    $ngrokLog = "$ngrokDir\ngrok.log"
+    $stdoutLog = "$ngrokDir\stdout.log"
+    $stderrLog = "$ngrokDir\stderr.log"
+
+    New-Item -ItemType Directory -Path $ngrokDir -Force | Out-Null
+
+    Invoke-WebRequest `
+      "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
+      -OutFile "C:\ngrok.zip"
+
+    Expand-Archive "C:\ngrok.zip" -DestinationPath $ngrokDir -Force
+
+    & $ngrokExe config add-authtoken $Env:NGROK_AUTHTOKEN
+    if ($LASTEXITCODE -ne 0) {
+      throw "Could not configure ngrok authtoken"
+    }
+
+    $ngrokArgs = @(
+      "tcp",
+      "3389",
+      "--log=$ngrokLog",
+      "--log-format=json"
+    )
+
+    $process = Start-Process `
+      -FilePath $ngrokExe `
+      -ArgumentList $ngrokArgs `
+      -PassThru `
+      -WindowStyle Hidden `
+      -RedirectStandardOutput $stdoutLog `
+      -RedirectStandardError $stderrLog
+
+    for ($attempt = 1; $attempt -le 30; $attempt++) {
+      Start-Sleep -Seconds 2
+      $process.Refresh()
+
+      if ($process.HasExited) {
+        Write-Host "ngrok exited with code $($process.ExitCode)" -ForegroundColor Red
+
+        foreach ($file in @($ngrokLog, $stdoutLog, $stderrLog)) {
+          if (Test-Path $file) {
+            Write-Host "=== $file ==="
+            Get-Content $file
           }
-          
-          if ($success) {
-            $raw_address = $response.tunnels[0].public_url -replace "tcp://", ""
-            Write-Host ""
-            Write-Host "==================================================" -ForegroundColor Green
-            Write-Host "  ADDRESS  : $raw_address" -ForegroundColor Yellow
-            Write-Host "  USERNAME : CynetAdmin" -ForegroundColor Yellow
-            Write-Host "  PASSWORD : Cynet@2026" -ForegroundColor Yellow
-            Write-Host "==================================================" -ForegroundColor Green
-          } else {
-            Write-Host "=== NGROK FAILED - FULL LOG ===" -ForegroundColor Red
-            if (Test-Path "C:\ngrok\ngrok.log") {
-              Get-Content "C:\ngrok\ngrok.log"
-            }
-            
-            Write-Host "=== PROCESS LIST ===" -ForegroundColor Red
-            Get-Process | Where-Object {$_.Name -like "*ngrok*"}
-            exit 1
-          }
+        }
+
+        throw "ngrok failed during startup"
+      }
+
+      try {
+        $response = Invoke-RestMethod `
+          "http://localhost:4040/api/tunnels" `
+          -ErrorAction Stop
+
+        $tunnel = $response.tunnels | Select-Object -First 1
+
+        if ($tunnel) {
+          $address = $tunnel.public_url -replace "^tcp://", ""
+          Write-Host "Ngrok tunnel started: $address" -ForegroundColor Green
+          exit 0
+        }
+      } catch {
+        Write-Host "Waiting for ngrok API ($attempt/30)..."
+      }
+    }
+
+    if (Test-Path $ngrokLog) {
+      Get-Content $ngrokLog
+    }
+
+    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    throw "ngrok remained running but did not create a tunnel"
