@@ -1,87 +1,413 @@
-- name: 3. Diagnose Ngrok startup
-  shell: pwsh
-  env:
-    NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
-  run: |
-    $ErrorActionPreference = "Stop"
+name: Windows Cloud RDP (Ngrok)
 
-    if ([string]::IsNullOrWhiteSpace($Env:NGROK_AUTHTOKEN)) {
-      throw "NGROK_AUTHTOKEN GitHub secret is missing"
-    }
+run-name: RDP connection #${{ github.run_number }} started by ${{ github.actor }}
 
-    Write-Output "::add-mask::$Env:NGROK_AUTHTOKEN"
+# This creates the "Run workflow" button in the Actions tab.
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: How long to keep the temporary connection online
+        required: true
+        default: '350'
+        type: choice
+        options:
+          - '60'
+          - '180'
+          - '350'
 
-    $ngrokDir = "C:\ngrok"
-    $ngrokExe = "$ngrokDir\ngrok.exe"
-    $ngrokLog = "$ngrokDir\ngrok.log"
-    $stdoutLog = "$ngrokDir\stdout.log"
-    $stderrLog = "$ngrokDir\stderr.log"
+permissions:
+  contents: read
 
-    New-Item -ItemType Directory -Path $ngrokDir -Force | Out-Null
+concurrency:
+  group: windows-cloud-rdp-ngrok
+  cancel-in-progress: true
 
-    Invoke-WebRequest `
-      "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" `
-      -OutFile "C:\ngrok.zip"
+jobs:
+  rdp:
+    name: Create RDP connection
+    runs-on: windows-latest
+    timeout-minutes: 360
 
-    Expand-Archive "C:\ngrok.zip" -DestinationPath $ngrokDir -Force
+    env:
+      RDP_USERNAME: CynetAdmin
+      RDP_PASSWORD: Cynet@2026
+      NGROK_DIR: C:\ngrok
+      LOG_DIR: ${{ runner.temp }}\rdp-logs
 
-    & $ngrokExe config add-authtoken $Env:NGROK_AUTHTOKEN
-    if ($LASTEXITCODE -ne 0) {
-      throw "Could not configure ngrok authtoken"
-    }
+    defaults:
+      run:
+        shell: pwsh
 
-    $ngrokArgs = @(
-      "tcp",
-      "3389",
-      "--log=$ngrokLog",
-      "--log-format=json"
-    )
+    steps:
+      - name: 1. Log runner information
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path $Env:LOG_DIR -Force | Out-Null
 
-    $process = Start-Process `
-      -FilePath $ngrokExe `
-      -ArgumentList $ngrokArgs `
-      -PassThru `
-      -WindowStyle Hidden `
-      -RedirectStandardOutput $stdoutLog `
-      -RedirectStandardError $stderrLog
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $disk = Get-PSDrive C
 
-    for ($attempt = 1; $attempt -le 30; $attempt++) {
-      Start-Sleep -Seconds 2
-      $process.Refresh()
+          Write-Host '==================================================' -ForegroundColor Cyan
+          Write-Host '  WINDOWS RDP RUNNER STARTING' -ForegroundColor Cyan
+          Write-Host "  Run ID       : $Env:GITHUB_RUN_ID"
+          Write-Host "  Runner       : $Env:RUNNER_NAME"
+          Write-Host "  OS           : $($os.Caption) $($os.Version)"
+          Write-Host "  CPU          : $($cpu.Name)"
+          Write-Host "  Memory       : $([math]::Round($os.TotalVisibleMemorySize / 1MB, 2)) GB"
+          Write-Host "  Free disk    : $([math]::Round($disk.Free / 1GB, 2)) GB"
+          Write-Host "  Started UTC  : $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss'))"
+          Write-Host '==================================================' -ForegroundColor Cyan
 
-      if ($process.HasExited) {
-        Write-Host "ngrok exited with code $($process.ExitCode)" -ForegroundColor Red
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion, OsBuildNumber,
+              CsSystemType, CsProcessors, CsTotalPhysicalMemory |
+            Format-List |
+            Out-File "$Env:LOG_DIR\runner-info.log"
 
-        foreach ($file in @($ngrokLog, $stdoutLog, $stderrLog)) {
-          if (Test-Path $file) {
-            Write-Host "=== $file ==="
-            Get-Content $file
+      - name: 2. Enable Remote Desktop and configure account
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host '[1/5] Enabling Remote Desktop...'
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 0
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host '[2/5] Creating or updating the administrator account...'
+          $securePassword = ConvertTo-SecureString $Env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name $Env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          if ($user) {
+            Set-LocalUser `
+              -Name $Env:RDP_USERNAME `
+              -Password $securePassword `
+              -PasswordNeverExpires $true
+            Write-Host "Updated local user '$Env:RDP_USERNAME'."
+          } else {
+            New-LocalUser `
+              -Name $Env:RDP_USERNAME `
+              -Password $securePassword `
+              -PasswordNeverExpires `
+              -AccountNeverExpires |
+              Out-Null
+            Write-Host "Created local user '$Env:RDP_USERNAME'."
           }
-        }
 
-        throw "ngrok failed during startup"
-      }
+          Add-LocalGroupMember `
+            -Group 'Administrators' `
+            -Member $Env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
 
-      try {
-        $response = Invoke-RestMethod `
-          "http://localhost:4040/api/tunnels" `
-          -ErrorAction Stop
+          Add-LocalGroupMember `
+            -Group 'Remote Desktop Users' `
+            -Member $Env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
 
-        $tunnel = $response.tunnels | Select-Object -First 1
+          & net.exe user runneradmin $Env:RDP_PASSWORD | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Could not update runneradmin (exit code $LASTEXITCODE)."
+          }
 
-        if ($tunnel) {
-          $address = $tunnel.public_url -replace "^tcp://", ""
-          Write-Host "Ngrok tunnel started: $address" -ForegroundColor Green
-          exit 0
-        }
-      } catch {
-        Write-Host "Waiting for ngrok API ($attempt/30)..."
-      }
-    }
+          Write-Host '[3/5] Verifying the RDP service and firewall...'
+          $service = Get-Service TermService
 
-    if (Test-Path $ngrokLog) {
-      Get-Content $ngrokLog
-    }
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' |
+            Select-Object DisplayName, Enabled, Direction, Action |
+            Format-Table -AutoSize |
+            Out-File "$Env:LOG_DIR\rdp-firewall.log"
 
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-    throw "ngrok remained running but did not create a tunnel"
+          if ($service.Status -ne 'Running') {
+            throw "Remote Desktop service is not running (status: $($service.Status))."
+          }
+
+          $listener = $null
+          for ($attempt = 1; $attempt -le 15; $attempt++) {
+            $listener = Get-NetTCPConnection `
+              -LocalPort 3389 `
+              -State Listen `
+              -ErrorAction SilentlyContinue
+
+            if ($listener) {
+              break
+            }
+
+            Write-Host "Waiting for the RDP listener ($attempt/15)..."
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $listener) {
+            throw 'Remote Desktop is not listening on TCP port 3389.'
+          }
+
+          Write-Host '[OK] Remote Desktop is listening on TCP 3389.' -ForegroundColor Green
+
+      - name: 3. Download, authenticate, and start Ngrok
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          if ([string]::IsNullOrWhiteSpace($Env:NGROK_AUTHTOKEN)) {
+            throw 'NGROK_AUTHTOKEN is missing. Add it in Settings > Secrets and variables > Actions.'
+          }
+
+          Write-Output "::add-mask::$Env:NGROK_AUTHTOKEN"
+
+          $ngrokZip = 'C:\ngrok.zip'
+          $ngrokExe = "$Env:NGROK_DIR\ngrok.exe"
+          $ngrokLog = "$Env:LOG_DIR\ngrok.log"
+          $stdoutLog = "$Env:LOG_DIR\ngrok-stdout.log"
+          $stderrLog = "$Env:LOG_DIR\ngrok-stderr.log"
+
+          New-Item -ItemType Directory -Path $Env:NGROK_DIR -Force | Out-Null
+          New-Item -ItemType Directory -Path $Env:LOG_DIR -Force | Out-Null
+
+          Write-Host '[4/5] Downloading Ngrok...'
+          Invoke-WebRequest `
+            -Uri 'https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip' `
+            -OutFile $ngrokZip `
+            -UseBasicParsing
+
+          Expand-Archive `
+            -Path $ngrokZip `
+            -DestinationPath $Env:NGROK_DIR `
+            -Force
+
+          if (-not (Test-Path $ngrokExe)) {
+            throw "Ngrok executable was not found at $ngrokExe."
+          }
+
+          & $ngrokExe version
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ngrok version check failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host 'Authenticating Ngrok...'
+          & $ngrokExe config add-authtoken $Env:NGROK_AUTHTOKEN
+          if ($LASTEXITCODE -ne 0) {
+            throw "Ngrok authentication failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host '[5/5] Starting the TCP tunnel...'
+          $arguments = @(
+            'tcp',
+            '3389',
+            "--log=$ngrokLog",
+            '--log-format=json',
+            '--log-level=info'
+          )
+
+          $process = Start-Process `
+            -FilePath $ngrokExe `
+            -ArgumentList $arguments `
+            -PassThru `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdoutLog `
+            -RedirectStandardError $stderrLog
+
+          Write-Host "Ngrok process started with PID $($process.Id)."
+
+          $tunnel = $null
+          for ($attempt = 1; $attempt -le 30; $attempt++) {
+            Start-Sleep -Seconds 2
+            $process.Refresh()
+
+            if ($process.HasExited) {
+              Write-Host "Ngrok exited with code $($process.ExitCode)." -ForegroundColor Red
+              foreach ($file in @($ngrokLog, $stdoutLog, $stderrLog)) {
+                if (Test-Path $file) {
+                  Write-Host "=== $file ==="
+                  Get-Content $file | Select-Object -Last 50
+                }
+              }
+              throw 'Ngrok stopped before creating a tunnel.'
+            }
+
+            try {
+              $response = Invoke-RestMethod `
+                -Uri 'http://127.0.0.1:4040/api/tunnels' `
+                -TimeoutSec 5 `
+                -ErrorAction Stop
+
+              $tunnel = $response.tunnels |
+                Where-Object { $_.proto -eq 'tcp' } |
+                Select-Object -First 1
+
+              if ($tunnel) {
+                Write-Host "Ngrok API became ready on attempt $attempt/30."
+                break
+              }
+            } catch {
+              Write-Host "Waiting for Ngrok API ($attempt/30): $($_.Exception.Message)"
+              if (Test-Path $ngrokLog) {
+                Get-Content $ngrokLog | Select-Object -Last 3
+              }
+            }
+          }
+
+          if (-not $tunnel) {
+            foreach ($file in @($ngrokLog, $stdoutLog, $stderrLog)) {
+              if (Test-Path $file) {
+                Write-Host "=== $file ==="
+                Get-Content $file | Select-Object -Last 100
+              }
+            }
+            Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            throw 'Ngrok remained running but did not create a TCP tunnel.'
+          }
+
+          $address = $tunnel.public_url -replace '^tcp://', ''
+          "RDP_ADDRESS=$address" | Out-File $Env:GITHUB_ENV -Encoding utf8 -Append
+          "NGROK_PROCESS_ID=$($process.Id)" | Out-File $Env:GITHUB_ENV -Encoding utf8 -Append
+          "NGROK_EXE=$ngrokExe" | Out-File $Env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host '[OK] Ngrok TCP tunnel is online.' -ForegroundColor Green
+
+      - name: 4. Show full connection information
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ([string]::IsNullOrWhiteSpace($Env:RDP_ADDRESS)) {
+            throw 'RDP_ADDRESS was not set by the Ngrok setup step.'
+          }
+
+          Write-Host ''
+          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host '  >>> RDP SERVER IS READY! <<<' -ForegroundColor Cyan
+          Write-Host "  ADDRESS  : $Env:RDP_ADDRESS" -ForegroundColor Yellow
+          Write-Host "  USERNAME : $Env:RDP_USERNAME" -ForegroundColor Yellow
+          Write-Host "  PASSWORD : $Env:RDP_PASSWORD" -ForegroundColor Yellow
+          Write-Host '==================================================' -ForegroundColor Green
+          Write-Host "  Windows  : mstsc /v:$Env:RDP_ADDRESS"
+          Write-Host "  Android  : Enter $Env:RDP_ADDRESS in your RDP app"
+          Write-Host '==================================================' -ForegroundColor Green
+
+          @"
+          ## RDP server is ready
+
+          | Connection field | Value |
+          | --- | --- |
+          | Address | ``$Env:RDP_ADDRESS`` |
+          | Username | ``$Env:RDP_USERNAME`` |
+          | Password | ``$Env:RDP_PASSWORD`` |
+          | Windows command | ``mstsc /v:$Env:RDP_ADDRESS`` |
+
+          The runner and tunnel are temporary and stop automatically when this workflow ends.
+          "@ | Out-File $Env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: 5. Keep connection alive and log health
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $duration = [int]$Env:DURATION_MINUTES
+          $started = Get-Date
+
+          Write-Host "Keeping the connection alive for $duration minutes."
+          Write-Host 'Use the Cancel workflow button to stop it early.'
+
+          for ($minute = 0; $minute -lt $duration; $minute++) {
+            $process = Get-Process `
+              -Id ([int]$Env:NGROK_PROCESS_ID) `
+              -ErrorAction SilentlyContinue
+
+            if (-not $process) {
+              throw 'Ngrok is no longer running.'
+            }
+
+            $service = Get-Service TermService -ErrorAction Stop
+            if ($service.Status -ne 'Running') {
+              Write-Warning 'Remote Desktop service stopped; restarting it.'
+              Start-Service TermService
+            }
+
+            try {
+              $response = Invoke-RestMethod `
+                -Uri 'http://127.0.0.1:4040/api/tunnels' `
+                -TimeoutSec 5 `
+                -ErrorAction Stop
+              $tunnel = $response.tunnels |
+                Where-Object { $_.proto -eq 'tcp' } |
+                Select-Object -First 1
+            } catch {
+              throw "Ngrok health API failed: $($_.Exception.Message)"
+            }
+
+            if (-not $tunnel) {
+              throw 'Ngrok is running but the TCP tunnel is missing.'
+            }
+
+            if (($minute % 5) -eq 0) {
+              $elapsed = [math]::Round(((Get-Date) - $started).TotalMinutes)
+              $remaining = $duration - $minute
+              $address = $tunnel.public_url -replace '^tcp://', ''
+              $rdpListening = [bool](Get-NetTCPConnection `
+                -LocalPort 3389 `
+                -State Listen `
+                -ErrorAction SilentlyContinue)
+
+              Write-Host "[HEALTH] $elapsed min elapsed | $remaining min left | endpoint=$address | RDP listening=$rdpListening | UTC=$((Get-Date).ToUniversalTime().ToString('HH:mm:ss'))" -ForegroundColor Cyan
+            }
+
+            Start-Sleep -Seconds 60
+          }
+
+          Write-Host 'Requested duration completed. The temporary runner will now stop.' -ForegroundColor Green
+
+      - name: 6. Print final diagnostics
+        if: always()
+        run: |
+          New-Item -ItemType Directory -Path $Env:LOG_DIR -Force | Out-Null
+          Write-Host '=== FINAL RDP DIAGNOSTICS ===' -ForegroundColor Cyan
+
+          Write-Host '--- Remote Desktop service ---'
+          Get-Service TermService -ErrorAction SilentlyContinue |
+            Format-List Name, Status, StartType |
+            Tee-Object -FilePath "$Env:LOG_DIR\final-service.log"
+
+          Write-Host '--- TCP 3389 listener ---'
+          Get-NetTCPConnection -LocalPort 3389 -ErrorAction SilentlyContinue |
+            Format-Table -AutoSize |
+            Tee-Object -FilePath "$Env:LOG_DIR\final-listener.log"
+
+          Write-Host '--- Ngrok process ---'
+          Get-Process ngrok -ErrorAction SilentlyContinue |
+            Format-List Id, ProcessName, StartTime, Responding |
+            Tee-Object -FilePath "$Env:LOG_DIR\final-ngrok-process.log"
+
+          Write-Host '--- Ngrok tunnels API ---'
+          try {
+            $tunnels = Invoke-RestMethod `
+              -Uri 'http://127.0.0.1:4040/api/tunnels' `
+              -TimeoutSec 5 `
+              -ErrorAction Stop
+            $tunnels |
+              ConvertTo-Json -Depth 8 |
+              Tee-Object -FilePath "$Env:LOG_DIR\final-tunnels.json"
+          } catch {
+            Write-Warning "Ngrok API unavailable: $($_.Exception.Message)"
+          }
+
+          foreach ($file in @(
+            "$Env:LOG_DIR\ngrok.log",
+            "$Env:LOG_DIR\ngrok-stdout.log",
+            "$Env:LOG_DIR\ngrok-stderr.log"
+          )) {
+            if (Test-Path $file) {
+              Write-Host "--- Last 100 lines: $file ---"
+              Get-Content $file | Select-Object -Last 100
+            }
+          }
