@@ -101,35 +101,36 @@ jobs:
       - name: 5. Generate Optimized .rdp Connection File
         run: |
           $ts_ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
-          $rdp = @"
-full address:s:$ts_ip
-username:s:CynetAdmin
-prompt for credentials:i:0
-authentication level:i:0
-screen mode id:i:2
-desktopwidth:i:1600
-desktopheight:i:900
-session bpp:i:24
-compression:i:1
-keyboardhook:i:2
-audiocapturemode:i:0
-audiomode:i:0
-redirectprinters:i:0
-redirectclipboard:i:1
-redirectcomports:i:0
-redirectsmartcards:i:0
-displayconnectionbar:i:1
-use multimon:i:0
-videoplaybackmode:i:1
-bandwidthautodetect:i:1
-networkautodetect:i:1
-connection type:i:7
-disable wallpaper:i:1
-disable full window drag:i:1
-disable menu anims:i:1
-allow font smoothing:i:0
-bitmapcachepersistenable:i:1
-"@
+          $lines = @(
+            "full address:s:$ts_ip",
+            "username:s:CynetAdmin",
+            "prompt for credentials:i:0",
+            "authentication level:i:0",
+            "screen mode id:i:2",
+            "desktopwidth:i:1600",
+            "desktopheight:i:900",
+            "session bpp:i:24",
+            "compression:i:1",
+            "keyboardhook:i:2",
+            "audiocapturemode:i:0",
+            "audiomode:i:0",
+            "redirectprinters:i:0",
+            "redirectclipboard:i:1",
+            "redirectcomports:i:0",
+            "redirectsmartcards:i:0",
+            "displayconnectionbar:i:1",
+            "use multimon:i:0",
+            "videoplaybackmode:i:1",
+            "bandwidthautodetect:i:1",
+            "networkautodetect:i:1",
+            "connection type:i:7",
+            "disable wallpaper:i:1",
+            "disable full window drag:i:1",
+            "disable menu anims:i:1",
+            "allow font smoothing:i:0",
+            "bitmapcachepersistenable:i:1"
+          )
+          $rdp = $lines -join "`r`n"
           $rdp | Out-File -FilePath "./optimized-connection.rdp" -Encoding ASCII
           Write-Host $rdp
           Write-Host ">>> Saved optimized-connection.rdp for IP $ts_ip" -ForegroundColor Green
