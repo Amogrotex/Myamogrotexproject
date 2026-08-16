@@ -9,11 +9,26 @@ jobs:
     timeout-minutes: 999
 
     steps:
-      - name: 1. Enable Remote Desktop & Firewall
+      - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
+          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+          # --- RDP performance tuning (server-side) ---
+          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $tsPol -Force | Out-Null
+          # Allow BOTH UDP and TCP (1=both, 2=TCP only). UDP is the big responsiveness win.
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force
+          # Cap color depth to 24-bit (less data than 32-bit)
+          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
+          # Keep compression on
+          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
+
+          Write-Host ">>> RDP enabled with UDP transport + performance tuning." -ForegroundColor Green
 
       - name: 2. Create Admin Account
         run: |
@@ -39,13 +54,20 @@ jobs:
           # Get Tailscale IP
           $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
           
+          # --- Diagnostics: is the path direct or relayed? (relay = slow) ---
+          Write-Host ""
+          Write-Host ">>> Tailscale netcheck (NAT type + DERP relay latency):" -ForegroundColor Cyan
+          & "C:\Program Files\Tailscale\tailscale.exe" netcheck
+          Write-Host ">>> Tailscale status (look for 'direct' on your peer, not 'relay'/'derp'):" -ForegroundColor Cyan
+          & "C:\Program Files\Tailscale\tailscale.exe" status
+          
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
           Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  >> Download the optimized .rdp artifact, or connect via mstsc to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
 
       - name: 4. Install Python, Java & Adoptium Temurin JDK
@@ -57,30 +79,68 @@ jobs:
           Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
 
           Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
-          # Adoptium API always points to the latest patch of the requested feature version
           $jdkUrl = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse"
           Invoke-WebRequest $jdkUrl -OutFile "C:\jdk.msi"
           Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
           Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
 
-          # Refresh PATH for this session so we can verify
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> TOOLCHAIN INSTALL SUMMARY <<<" -ForegroundColor Cyan
-          # Python
           $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
           if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
           else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
-          # Java
           $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
           if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
           else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
           Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Keep Server Alive (6 Hours)
+      - name: 5. Generate Optimized .rdp Connection File
+        run: |
+          $ts_ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
+          $rdp = @"
+full address:s:$ts_ip
+username:s:CynetAdmin
+prompt for credentials:i:0
+authentication level:i:0
+screen mode id:i:2
+desktopwidth:i:1600
+desktopheight:i:900
+session bpp:i:24
+compression:i:1
+keyboardhook:i:2
+audiocapturemode:i:0
+audiomode:i:0
+redirectprinters:i:0
+redirectclipboard:i:1
+redirectcomports:i:0
+redirectsmartcards:i:0
+displayconnectionbar:i:1
+use multimon:i:0
+videoplaybackmode:i:1
+bandwidthautodetect:i:1
+networkautodetect:i:1
+connection type:i:7
+disable wallpaper:i:1
+disable full window drag:i:1
+disable menu anims:i:1
+allow font smoothing:i:0
+bitmapcachepersistenable:i:1
+"@
+          $rdp | Out-File -FilePath "./optimized-connection.rdp" -Encoding ASCII
+          Write-Host $rdp
+          Write-Host ">>> Saved optimized-connection.rdp for IP $ts_ip" -ForegroundColor Green
+
+      - name: 6. Upload Optimized .rdp File
+        uses: actions/upload-artifact@v4
+        with:
+          name: optimized-rdp-connection
+          path: ./optimized-connection.rdp
+
+      - name: 7. Keep Server Alive (6 Hours)
         run: |
           for ($i = 1; $i -le 999; $i++) {
             Start-Sleep -Seconds 60
