@@ -2,24 +2,6 @@ name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
-    inputs:
-      minecraft_version:
-        description: 'Minecraft version, e.g. 1.12.2 / 1.16.5 / 1.20.1'
-        required: true
-        default: '1.12.2'
-      forge_version:
-        description: 'Forge build number that matches the MC version (e.g. 14.23.5.2864)'
-        required: true
-        default: '14.23.5.2864'
-      java_version:
-        description: 'Java the server needs: 1.12.2->8, 1.17-1.20.4->17, 1.20.5+->21'
-        type: choice
-        options: ['8', '17', '21']
-        default: '8'
-      ram_gb:
-        description: 'Server RAM in GB (16GB box -> 8)'
-        required: true
-        default: '8'
 
 jobs:
   build:
@@ -43,7 +25,7 @@ jobs:
           Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
 
-          # --- High Performance power plan (no CPU throttling = faster MC server + smoother RDP) ---
+          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
 
           Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
@@ -92,115 +74,32 @@ jobs:
           Write-Host "  >> Download the optimized .rdp artifact, or mstsc to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 4. Install Python & Java (Adoptium Temurin)
+      - name: 4. Install Python & Java (Adoptium Temurin 21)
         run: |
-          $jver = "${{ inputs.java_version }}"
-
           Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
           Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
           Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
           Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
 
-          Write-Host ">>> Installing Temurin JDK 21 (system default) ..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk21.msi"
-          Start-Process msiexec -ArgumentList '/i C:\jdk21.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
-          Remove-Item "C:\jdk21.msi" -Force -ErrorAction SilentlyContinue
-
-          # Install the selected Java for the Minecraft server (without changing system PATH)
-          if ($jver -ne "21") {
-            Write-Host ">>> Installing Temurin JDK $jver (for Minecraft) ..." -ForegroundColor Cyan
-            Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/$jver/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdksel.msi"
-            Start-Process msiexec -ArgumentList "/i C:\jdksel.msi /quiet ADDLOCAL=FeatureMain,FeatureJarFileRunWith /norestart" -Wait
-            Remove-Item "C:\jdksel.msi" -Force -ErrorAction SilentlyContinue
-          }
+          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
+          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
+          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
 
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          $jSel = Get-ChildItem "C:\Program Files\Eclipse Adoptium\jdk-$jver*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
-          Write-Host "  Default java: $(& java -version 2>&1 | Select-Object -First 1)" -ForegroundColor Yellow
-          if ($jSel) { Write-Host "  MC java ($jver): $($jSel.FullName)\bin\java.exe" -ForegroundColor Yellow }
-          else       { Write-Host "  MC java ($jver): NOT FOUND" -ForegroundColor Red }
+          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
+          if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
+          else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
+          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
+          if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
+          else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
+          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Install Minecraft Forge Server
-        run: |
-          $mc    = "${{ inputs.minecraft_version }}"
-          $forge = "${{ inputs.forge_version }}"
-          $jver  = "${{ inputs.java_version }}"
-          $ram   = "${{ inputs.ram_gb }}"
-
-          $serverDir = "C:\Minecraft"
-          New-Item -ItemType Directory -Path $serverDir -Force | Out-Null
-          Add-MpPreference -ExclusionPath $serverDir -ErrorAction SilentlyContinue
-
-          # Locate the selected Java
-          $jDir = Get-ChildItem "C:\Program Files\Eclipse Adoptium\jdk-$jver*" -Directory -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $jDir) { throw "Java $jver not found - Step 4 must succeed first." }
-          $javaX = Join-Path $jDir.FullName "bin\java.exe"
-          Write-Host "Using Java $jver : $javaX" -ForegroundColor Cyan
-          & $javaX -version
-
-          # Download + run the Forge installer (installs vanilla server jar + libraries)
-          $installer = "https://maven.minecraftforge.net/net/minecraftforge/forge/$mc-$forge/forge-$mc-$forge-installer.jar"
-          Write-Host "Downloading Forge $mc-$forge installer..." -ForegroundColor Cyan
-          Invoke-WebRequest $installer -OutFile "$serverDir\forge-installer.jar"
-          Push-Location $serverDir
-          & $javaX -jar "$serverDir\forge-installer.jar" --installServer
-          Pop-Location
-          Remove-Item "$serverDir\forge-installer.jar" -Force -ErrorAction SilentlyContinue
-
-          # Accept EULA
-          Set-Content -Path "$serverDir\eula.txt" -Value "eula=true" -Encoding ASCII
-
-          # Aikar GC flags
-          $flags = '-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:InitiatingHeapOccupancyPercent=15 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true'
-
-          # Detect launch mode: universal jar (Forge <= 1.12.2) vs win_args (Forge >= 1.14)
-          $universal = Test-Path "$serverDir\forge-$mc-$forge-universal.jar"
-          $findJava  = "for /d %%D in (`"C:\Program Files\Eclipse Adoptium\jdk-$jver*`") do set `"JAVACMD=%%D\bin\java.exe`""
-          $errLine   = 'if not defined JAVACMD echo ERROR: Java not found ^& pause ^& exit /b 1'
-          if ($universal) {
-            $launchLine = '"%JAVACMD%" -Xms' + $ram + 'G -Xmx' + $ram + 'G ' + $flags + ' -jar "forge-' + $mc + '-' + $forge + '-universal.jar" nogui'
-          } else {
-            Set-Content -Path "$serverDir\user_jvm_args.txt" -Value "-Xms${ram}G`r`n-Xmx${ram}G" -Encoding ASCII
-            $launchLine = '"%JAVACMD%" ' + $flags + ' @"user_jvm_args.txt" @"libraries\net\minecraftforge\forge\' + $mc + '-' + $forge + '\win_args.txt" nogui'
-          }
-
-          $startLines = @(
-            '@echo off',
-            'title Minecraft Forge Server',
-            'cd /d "%~dp0"',
-            'set "JAVACMD="',
-            $findJava,
-            $errLine,
-            $launchLine,
-            'pause'
-          )
-          $startLines | Set-Content -Path "$serverDir\start.bat" -Encoding ASCII
-
-          # Desktop shortcut (Public Desktop = visible to all users, always exists)
-          try {
-            $ws = New-Object -ComObject WScript.Shell
-            $sc = $ws.CreateShortcut("C:\Users\Public\Desktop\Minecraft Server.lnk")
-            $sc.TargetPath = "$serverDir\start.bat"
-            $sc.WorkingDirectory = $serverDir
-            $sc.IconLocation = "$javaX,0"
-            $sc.Save()
-          } catch { Write-Host "Shortcut skipped: $_" -ForegroundColor Yellow }
-
-          $mode = if ($universal) { "universal jar" } else { "win_args (modern)" }
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> MINECRAFT FORGE $mc-$forge READY <<<" -ForegroundColor Cyan
-          Write-Host "  Folder  : $serverDir" -ForegroundColor Yellow
-          Write-Host "  Java    : $jver  | RAM: ${ram}G | Launch: $mode" -ForegroundColor Yellow
-          Write-Host "  EULA    : accepted" -ForegroundColor Yellow
-          Write-Host "  >> RDP in and double-click 'Minecraft Server' on the desktop." -ForegroundColor Magenta
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 6. Generate Optimized .rdp Connection File
+      - name: 5. Generate Optimized .rdp Connection File
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           $ts_ip = (& $ts ip -4 2>$null).Trim()
@@ -240,13 +139,13 @@ jobs:
           Write-Host $rdp
           Write-Host ">>> Saved optimized-connection.rdp for IP $ts_ip" -ForegroundColor Green
 
-      - name: 7. Upload Optimized .rdp File
+      - name: 6. Upload Optimized .rdp File
         uses: actions/upload-artifact@v4
         with:
           name: optimized-rdp-connection
           path: ./optimized-connection.rdp
 
-      - name: 8. Keep Server Alive (6 Hours)
+      - name: 7. Keep Server Alive (6 Hours)
         run: |
           for ($i = 1; $i -le 999; $i++) {
             Start-Sleep -Seconds 60
