@@ -1,149 +1,736 @@
 name: Windows Cloud RDP
 
+# ─────────────────────────────────────────────────────────────
+#  VERSION SELECT UI
+#  Actions ▸ Windows Cloud RDP ▸ "Run workflow" shows this form.
+#  (GitHub allows max 10 workflow_dispatch inputs - all 10 used.)
+# ─────────────────────────────────────────────────────────────
 on:
   workflow_dispatch:
+    inputs:
+      server_type:
+        description: "Server software"
+        type: choice
+        required: true
+        default: forge
+        options:
+          - forge
+          - neoforge
+          - fabric
+          - paper
+          - purpur
+          - vanilla
+          - none (RDP only)
+      mc_version:
+        description: "Minecraft version"
+        type: choice
+        required: true
+        default: "1.12.2"
+        options:
+          - latest
+          - "1.21.8"
+          - "1.21.4"
+          - "1.21.1"
+          - "1.20.6"
+          - "1.20.4"
+          - "1.20.1"
+          - "1.19.2"
+          - "1.18.2"
+          - "1.16.5"
+          - "1.12.2"
+          - "1.8.9"
+          - "1.7.10"
+          - custom
+      custom_mc_version:
+        description: "Custom MC version (only if 'custom' above, e.g. 1.20.2)"
+        type: string
+        required: false
+        default: ""
+      server_build:
+        description: "Loader/build version: auto | recommended | latest | exact (e.g. 47.4.10)"
+        type: string
+        required: false
+        default: "auto"
+      java_version:
+        description: "Java (JDK) version"
+        type: choice
+        required: true
+        default: auto
+        options:
+          - auto
+          - "8"
+          - "11"
+          - "17"
+          - "21"
+      python_version:
+        description: "Python version"
+        type: choice
+        required: true
+        default: "3.12.10"
+        options:
+          - none
+          - "3.10.11"
+          - "3.11.9"
+          - "3.12.10"
+          - "3.13.7"
+      ram:
+        description: "Server RAM (runner has 16 GB)"
+        type: choice
+        required: true
+        default: "8G"
+        options: ["4G", "6G", "8G", "10G", "12G"]
+      rdp_quality:
+        description: "RDP profile"
+        type: choice
+        required: true
+        default: performance
+        options:
+          - performance
+          - balanced
+          - quality
+      autostart_server:
+        description: "Start the MC server automatically (headless, logs to C:\\Minecraft\\logs)"
+        type: boolean
+        required: false
+        default: false
+      keep_alive_hours:
+        description: "Keep the runner alive for"
+        type: choice
+        required: true
+        default: "5.5"
+        options: ["1", "2", "3", "4", "5", "5.5"]
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 999
+    timeout-minutes: 360
+
+    env:
+      MC_SERVER_DIR: C:\Minecraft
+      RDP_USER: CynetAdmin
+      # Override by adding a repo secret named RDP_PASSWORD
+      RDP_PASS: ${{ secrets.RDP_PASSWORD || 'Cynet@2026' }}
 
     steps:
-      - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
+      # ───────────────────────────────────────────────────────
+      - name: 0. Resolve selected versions
+        id: resolve
+        shell: pwsh
+        env:
+          IN_SERVER_TYPE: ${{ inputs.server_type }}
+          IN_MC: ${{ inputs.mc_version }}
+          IN_MC_CUSTOM: ${{ inputs.custom_mc_version }}
+          IN_BUILD: ${{ inputs.server_build }}
+          IN_JAVA: ${{ inputs.java_version }}
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference    = 'SilentlyContinue'
+          $UA = @{ 'User-Agent' = 'github-actions-rdp-workflow/1.0' }
+
+          function Test-Url($u) {
+            try { (Invoke-WebRequest -Uri $u -Method Head -UseBasicParsing -Headers $UA).StatusCode -eq 200 }
+            catch { $false }
+          }
+          function Ver([string]$v) {
+            # "1.12.2" -> comparable [version]; strips snapshot junk
+            $m = [regex]::Match($v, '^\d+(\.\d+){0,3}')
+            if ($m.Success) { return [version]$m.Value }
+            return [version]'0.0'
+          }
+
+          $type = ($env:IN_SERVER_TYPE -split ' ')[0]      # "none (RDP only)" -> "none"
+          $mc   = $env:IN_MC.Trim()
+          $bld  = if ([string]::IsNullOrWhiteSpace($env:IN_BUILD)) { 'auto' } else { $env:IN_BUILD.Trim().ToLower() }
+
+          # ---- Minecraft version ----------------------------------------
+          $manifest = Invoke-RestMethod 'https://launchermeta.mojang.com/mc/game/version_manifest_v2.json' -Headers $UA
+          if ($mc -eq 'custom') {
+            $mc = $env:IN_MC_CUSTOM.Trim()
+            if (-not $mc) { throw "mc_version = 'custom' but custom_mc_version is empty." }
+          }
+          if ($mc -eq 'latest') { $mc = $manifest.latest.release }
+          if (-not ($manifest.versions.id -contains $mc)) {
+            throw "Unknown Minecraft version '$mc'. Check the Mojang version manifest."
+          }
+          Write-Host ">>> Minecraft version : $mc" -ForegroundColor Cyan
+
+          # ---- Java version ---------------------------------------------
+          $java = $env:IN_JAVA
+          if ($java -eq 'auto') {
+            $v = Ver $mc
+            if     ($v -lt [version]'1.17') { $java = '8'  }
+            elseif ($v -lt [version]'1.20.5') { $java = '17' }
+            else                             { $java = '21' }
+            # Fabric/Paper/Purpur on 1.17-1.20.4 are happiest on 17; Forge <=1.16.5 needs 8.
+          }
+          Write-Host ">>> Java (JDK)        : $java" -ForegroundColor Cyan
+
+          # ---- Server artifact ------------------------------------------
+          $url = ''; $kind = 'none'; $label = 'none'
+
+          switch ($type) {
+
+            'forge' {
+              $promos = Invoke-RestMethod 'https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json' -Headers $UA
+              if ($bld -in @('auto','recommended')) {
+                $fv = $promos.promos."$mc-recommended"
+                if (-not $fv) { $fv = $promos.promos."$mc-latest" }
+              } elseif ($bld -eq 'latest') {
+                $fv = $promos.promos."$mc-latest"
+                if (-not $fv) { $fv = $promos.promos."$mc-recommended" }
+              } else { $fv = $bld }
+              if (-not $fv) { throw "No Forge build found for Minecraft $mc." }
+              $base = 'https://maven.minecraftforge.net/net/minecraftforge/forge'
+              # Legacy versions (1.7.10, some 1.8.x/1.9.x) use a duplicated MC suffix
+              $cands = @("$mc-$fv", "$mc-$fv-$mc")
+              foreach ($c in $cands) {
+                $try = "$base/$c/forge-$c-installer.jar"
+                if (Test-Url $try) { $url = $try; break }
+              }
+              if (-not $url) { throw "Forge installer not found for $mc-$fv." }
+              $kind = 'installer'; $label = "Forge $fv"
+              break
+            }
+
+            'neoforge' {
+              if ((Ver $mc) -lt [version]'1.20.2') { throw "NeoForge only supports Minecraft 1.20.2+ (you picked $mc)." }
+              $prefix = $mc -replace '^1\.', ''            # 1.21.4 -> 21.4 ; 1.21 -> 21
+              [xml]$meta = (Invoke-WebRequest 'https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml' -UseBasicParsing -Headers $UA).Content
+              $all = @($meta.metadata.versioning.versions.version)
+              if ($prefix -notmatch '\.') { $pool = $all | Where-Object { $_ -match "^$([regex]::Escape($prefix))\.0\." } }
+              else                        { $pool = $all | Where-Object { $_ -match "^$([regex]::Escape($prefix))\." } }
+              if ($bld -notin @('auto','recommended','latest')) {
+                $nv = $bld
+              } else {
+                $stable = $pool | Where-Object { $_ -notmatch 'beta' }
+                $nv = if ($stable) { $stable[-1] } else { $pool[-1] }
+              }
+              if (-not $nv) { throw "No NeoForge build found for Minecraft $mc." }
+              $url = "https://maven.neoforged.net/releases/net/neoforged/neoforge/$nv/neoforge-$nv-installer.jar"
+              if (-not (Test-Url $url)) { throw "NeoForge installer not found: $url" }
+              $kind = 'installer'; $label = "NeoForge $nv"
+              break
+            }
+
+            'fabric' {
+              $loaders = Invoke-RestMethod "https://meta.fabricmc.net/v2/versions/loader/$mc" -Headers $UA
+              if (-not $loaders) { throw "Fabric has no loader for Minecraft $mc." }
+              $lv  = if ($bld -in @('auto','recommended','latest')) { $loaders[0].loader.version } else { $bld }
+              $iv  = (Invoke-RestMethod 'https://meta.fabricmc.net/v2/versions/installer' -Headers $UA)[0].version
+              $url = "https://meta.fabricmc.net/v2/versions/loader/$mc/$lv/$iv/server/jar"
+              if (-not (Test-Url $url)) { throw "Fabric server launcher not available for $mc / loader $lv." }
+              $kind = 'jar'; $label = "Fabric loader $lv"
+              break
+            }
+
+            { $_ -in 'paper','purpur' } {
+              try {
+                if ($type -eq 'paper') {
+                  $q = if ($bld -in @('auto','recommended','latest')) { 'latest' } else { $bld }
+                  $b = Invoke-RestMethod "https://fill.papermc.io/v3/projects/paper/versions/$mc/builds/$q" -Headers $UA
+                  $url   = $b.downloads.'server:default'.url
+                  $label = "Paper build $($b.id)"
+                } else {
+                  $b   = Invoke-RestMethod "https://api.purpurmc.org/v2/purpur/$mc/latest" -Headers $UA
+                  $num = if ($bld -in @('auto','recommended','latest')) { $b.build } else { $bld }
+                  $url = "https://api.purpurmc.org/v2/purpur/$mc/$num/download"
+                  $label = "Purpur build $num"
+                }
+              } catch {
+                throw "$type has no build for Minecraft $mc (build '$bld'). Pick a version listed on the $type downloads page."
+              }
+              if (-not $url) { throw "No $type build found for Minecraft $mc." }
+              $kind = 'jar'
+              break
+            }
+
+            'vanilla' {
+              $entry = $manifest.versions | Where-Object { $_.id -eq $mc } | Select-Object -First 1
+              $meta  = Invoke-RestMethod $entry.url -Headers $UA
+              if (-not $meta.downloads.server) { throw "Mojang publishes no server jar for $mc." }
+              $url = $meta.downloads.server.url
+              $kind = 'jar'; $label = "Vanilla $mc"
+              break
+            }
+
+            default { $kind = 'none'; $label = 'RDP only (no server)' }
+          }
+
+          if ($url -and -not (Test-Url $url)) {
+            throw "Resolved download URL is not reachable (bad build number?): $url"
+          }
+
+          Write-Host ">>> Server            : $label" -ForegroundColor Cyan
+          if ($url) { Write-Host ">>> Download          : $url" -ForegroundColor DarkGray }
+
+          "mc_version=$mc"      | Out-File $env:GITHUB_OUTPUT -Append
+          "java_version=$java"  | Out-File $env:GITHUB_OUTPUT -Append
+          "server_type=$type"   | Out-File $env:GITHUB_OUTPUT -Append
+          "server_kind=$kind"   | Out-File $env:GITHUB_OUTPUT -Append
+          "server_url=$url"     | Out-File $env:GITHUB_OUTPUT -Append
+          "server_label=$label" | Out-File $env:GITHUB_OUTPUT -Append
+
+          @"
+          ### 🎮 Selected configuration
+          | Item | Value |
+          |---|---|
+          | Server software | ``$type`` |
+          | Minecraft | ``$mc`` |
+          | Build | $label |
+          | Java | Temurin JDK $java |
+          | Python | ``${{ inputs.python_version }}`` |
+          | RAM | ``${{ inputs.ram }}`` |
+          | RDP profile | ``${{ inputs.rdp_quality }}`` |
+          | Auto-start | ``${{ inputs.autostart_server }}`` |
+          | Keep alive | ``${{ inputs.keep_alive_hours }} h`` |
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append
+
+      # ───────────────────────────────────────────────────────
+      - name: 1. Enable RDP + full speed tuning (UDP, H.264, 60 FPS, no throttling)
+        shell: pwsh
+        env:
+          QUALITY: ${{ inputs.rdp_quality }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Set-Reg($Path, $Name, $Value) {
+            if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+            New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType DWord -Force | Out-Null
+          }
+
+          $TS    = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
+          $RDP   = "$TS\WinStations\RDP-Tcp"
+          $WS    = "$TS\WinStations"
+          $POL   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+          $TERMDD= 'HKLM:\SYSTEM\CurrentControlSet\Services\TermDD'
+          $LANMAN= 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanWorkstation\Parameters'
+          $MMSP  = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+
+          # ── 1. Turn RDP on, no NLA (lets the .rdp file auto-logon) ──────────
+          Set-Reg $TS  'fDenyTSConnections' 0
+          Set-Reg $RDP 'UserAuthentication' 0
+          Set-Reg $RDP 'SecurityLayer'      1
+          # Kill server-side session limits / idle disconnects
+          Set-Reg $RDP 'fInheritMaxIdleTime'    0
+          Set-Reg $RDP 'MaxIdleTime'            0
+          Set-Reg $RDP 'MaxConnectionTime'      0
+          Set-Reg $RDP 'MaxDisconnectionTime'   0
+          # Remove the artificial input-latency delay
+          Set-Reg $RDP 'InteractiveDelay'       0
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-          # --- RDP performance tuning (server-side) ---
-          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          New-Item -Path $tsPol -Force | Out-Null
-          # Allow BOTH UDP and TCP (1=both, 2=TCP only). UDP is the big responsiveness win.
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force
-          # Cap color depth to 24-bit (less data than 32-bit)
-          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
-          # Keep compression on
-          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
+          # ── 2. TRANSPORT: 0 = "Use both UDP and TCP" ───────────────────────
+          # NOTE: the old value 1 actually means "Use only TCP" - it was
+          # silently DISABLING the UDP transport. 0 is the fast one.
+          Set-Reg $POL 'SelectTransport'  0
+          Set-Reg $POL 'fClientDisableUDP' 0
 
-          Write-Host ">>> RDP enabled with UDP transport + performance tuning." -ForegroundColor Green
+          # ── 3. GRAPHICS PIPELINE: H.264/AVC 444 + hardware encode ──────────
+          Set-Reg $POL 'AVC444ModePreferred'         1   # H.264 4:4:4 (crisp text)
+          Set-Reg $POL 'AVCHardwareEncodePreferred'  1   # always attempt HW encode
+          Set-Reg $POL 'bEnumerateHWBeforeSW'        1   # prefer GPU over software
+          Set-Reg $POL 'fEnableVirtualizedGraphics'  1   # RemoteFX encoding on
+          Set-Reg $POL 'fEnableRemoteFXAdvancedRemoteApp' 1
 
+          # ── 4. 60 FPS instead of the default 30 (15 ms frame interval) ─────
+          Set-Reg $WS  'DWMFRAMEINTERVAL'            15
+          # NOTE: this is an ENUM (1=highest, 2=medium, 3=lowest), NOT an FPS
+          # count - the widely-copied "=60" value is meaningless.
+          Set-Reg $POL 'VGOptimization_CaptureFrameRate' 1
+
+          # ── 5. Remove Windows' own network/CPU throttles ───────────────────
+          Set-Reg $TERMDD 'FlowControlDisable'              1
+          Set-Reg $TERMDD 'FlowControlDisplayBandwidth'     0x10
+          Set-Reg $TERMDD 'FlowControlChannelBandwidth'     0x90
+          Set-Reg $TERMDD 'FlowControlChargePostCompression' 0
+          Set-Reg $LANMAN 'DisableBandwidthThrottling'      1
+          Set-Reg $LANMAN 'DisableLargeMtu'                 0
+          Set-Reg $MMSP   'SystemResponsiveness'            0
+          # 0xFFFFFFFF as a signed DWord = -1 = "throttling completely off"
+          Set-Reg $MMSP   'NetworkThrottlingIndex'          ([int32]-1)
+
+          # ── 6. Per-profile quality/bandwidth trade-off ─────────────────────
+          #  ColorDepth        : 2=16bit 3=24bit 4=32bit  (this is an ENUM, not bpp!)
+          #  MaxCompressionLevel: 0=none 1=less-memory 2=balanced 3=less-bandwidth
+          #  ImageQuality      : 1=low(default/medium) 2=high 3=lossless
+          #  VisualExperience  : 0=rich multimedia 1=text
+          #  GraphicsProfile   : 1=scalability 2=system-chooses 3=min-bandwidth
+          switch ($env:QUALITY) {
+            'performance' { $cd=2; $comp=3; $iq=1; $vis=1; $gp=3 }  # lowest latency
+            'balanced'    { $cd=3; $comp=2; $iq=2; $vis=1; $gp=2 }
+            'quality'     { $cd=4; $comp=0; $iq=3; $vis=0; $gp=2 }  # sharpest
+          }
+          Set-Reg $POL 'ColorDepth'                    $cd
+          Set-Reg $POL 'MaxCompressionLevel'           $comp
+          Set-Reg $POL 'ImageQuality'                  $iq
+          Set-Reg $POL 'VisualExperiencePolicy'        $vis
+          Set-Reg $POL 'GraphicsProfile'               $gp
+          # enum: 1=highest quality, 2=medium, 3=lowest (= least bandwidth)
+          Set-Reg $POL 'VGOptimization_CompressionRatio' $(if ($vis -eq 1) { 3 } else { 1 })
+          Set-Reg $POL 'fCompressionEnabled'           $(if ($comp -eq 0) { 0 } else { 1 })
+          # Strip desktop eye-candy that costs bandwidth on every redraw
+          if ($vis -eq 1) { Set-Reg $POL 'fNoRemoteDesktopWallpaper' 1 }
+
+          # ── 7. NIC-level latency: no interrupt moderation, no power saving ─
+          try {
+            Disable-NetAdapterPowerManagement -Name * -ErrorAction SilentlyContinue
+            Set-NetAdapterAdvancedProperty -Name * -DisplayName 'Interrupt Moderation' -DisplayValue 'Disabled' -ErrorAction SilentlyContinue
+          } catch { }
+          # TCP: low-latency congestion control, no Nagle delay-ACK stalls
+          netsh int tcp set global autotuninglevel=normal 2>&1 | Out-Null
+          netsh int tcp set supplemental Internet congestionprovider=ctcp 2>&1 | Out-Null
+
+          # ── 8. Max CPU: high-performance power plan, no core parking ───────
+          powercfg /setactive SCHEME_MIN 2>&1 | Out-Null
+          powercfg /change monitor-timeout-ac 0 2>&1 | Out-Null
+          powercfg /change standby-timeout-ac 0 2>&1 | Out-Null
+
+          # Restart the graphics/session services so everything takes effect
+          Restart-Service -Name UmRdpService -Force -ErrorAction SilentlyContinue
+
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SPEED TUNING APPLIED <<<"  -ForegroundColor Cyan
+          Write-Host "  Profile        : $env:QUALITY"     -ForegroundColor Yellow
+          Write-Host "  Transport      : UDP + TCP (SelectTransport=0)" -ForegroundColor Yellow
+          Write-Host "  Codec          : H.264/AVC 444, HW encode preferred" -ForegroundColor Yellow
+          Write-Host "  Frame rate     : 60 FPS (DWMFRAMEINTERVAL=15)"  -ForegroundColor Yellow
+          Write-Host "  Compression    : level $comp / image quality $iq" -ForegroundColor Yellow
+          Write-Host "  Throttling     : disabled (TermDD + Lanman + MMCSS)" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
+
+      # ───────────────────────────────────────────────────────
       - name: 2. Create Admin Account
+        shell: pwsh
         run: |
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026
+          $Password = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          New-LocalUser -Name $env:RDP_USER -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USER -ErrorAction SilentlyContinue
+          net user runneradmin $env:RDP_PASS
 
-      - name: 3. Install & Connect Tailscale VPN
+      # ───────────────────────────────────────────────────────
+      - name: 3. Install & Connect Tailscale (direct-path optimised)
+        shell: pwsh
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Download and install Tailscale silently
+          $ProgressPreference = 'SilentlyContinue'
           Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
-          
-          # Connect to Tailscale network
+
+          # Open the WireGuard port so peers can punch a DIRECT hole instead of
+          # falling back to a DERP relay (relay = the #1 cause of laggy RDP).
+          New-NetFirewallRule -DisplayName "Tailscale UDP direct" -Direction Inbound `
+            -Protocol UDP -LocalPort 41641 -Action Allow -ErrorAction SilentlyContinue | Out-Null
+
           Start-Sleep -Seconds 5
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server"
-          
+          $tsExe = "C:\Program Files\Tailscale\tailscale.exe"
+          & $tsExe up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" --accept-risk=all
           Start-Sleep -Seconds 8
-          
-          # Get Tailscale IP
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          
-          # --- Diagnostics: is the path direct or relayed? (relay = slow) ---
+
+          $ts_ip = (& $tsExe ip -4).Trim()
+          "TS_IP=$ts_ip" | Out-File $env:GITHUB_ENV -Append
+
+          Write-Host ">>> Tailscale netcheck (NAT type + nearest DERP latency):" -ForegroundColor Cyan
+          & $tsExe netcheck
           Write-Host ""
-          Write-Host ">>> Tailscale netcheck (NAT type + DERP relay latency):" -ForegroundColor Cyan
-          & "C:\Program Files\Tailscale\tailscale.exe" netcheck
-          Write-Host ">>> Tailscale status (look for 'direct' on your peer, not 'relay'/'derp'):" -ForegroundColor Cyan
-          & "C:\Program Files\Tailscale\tailscale.exe" status
-          
-          Write-Host ""
+          Write-Host ">>> Tailscale status:" -ForegroundColor Cyan
+          & $tsExe status
+
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
-          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Download the optimized .rdp artifact, or connect via mstsc to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  >>> RDP SERVER IS READY! <<<"                     -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip"                            -ForegroundColor Yellow
+          Write-Host "  Username     : $env:RDP_USER"                     -ForegroundColor Yellow
+          Write-Host "  Password     : (secret RDP_PASSWORD or default)"  -ForegroundColor Yellow
+          Write-Host "  TIP: run 'tailscale status' on YOUR machine. If it says" -ForegroundColor Magenta
+          Write-Host "       'relay' instead of 'direct', that is your lag."     -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 4. Install Python, Java & Adoptium Temurin JDK
+      # ───────────────────────────────────────────────────────
+      - name: 3b. Cut background CPU/disk contention
+        shell: pwsh
         run: |
-          Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
-          $pyUrl = "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe"
-          Invoke-WebRequest $pyUrl -OutFile "C:\python-installer.exe"
-          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
-          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
+          # A GitHub runner is only 4 vCPU - Defender scanning the Minecraft
+          # world dir and Search indexing both steal frames from the session.
+          try {
+            Add-MpPreference -ExclusionPath "C:\Minecraft" -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableScanningNetworkFiles $true -ErrorAction SilentlyContinue
+            Write-Host ">>> Defender real-time scanning disabled for this session." -ForegroundColor Green
+          } catch { Write-Host "Defender tweak skipped: $_" -ForegroundColor DarkGray }
 
-          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
-          $jdkUrl = "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse"
-          Invoke-WebRequest $jdkUrl -OutFile "C:\jdk.msi"
+          foreach ($svc in 'WSearch','SysMain','wuauserv','DiagTrack','MapsBroker') {
+            Stop-Service $svc -Force -ErrorAction SilentlyContinue
+            Set-Service  $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          Write-Host ">>> Stopped Search / SysMain / Update / Telemetry services." -ForegroundColor Green
+
+      # ───────────────────────────────────────────────────────
+      - name: 4. Install Temurin JDK ${{ steps.resolve.outputs.java_version }} & Python
+        id: toolchain
+        shell: pwsh
+        env:
+          JAVA_MAJOR: ${{ steps.resolve.outputs.java_version }}
+          PY_VERSION: ${{ inputs.python_version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference    = 'SilentlyContinue'
+          $UA = @{ 'User-Agent' = 'github-actions-rdp-workflow/1.0' }
+
+          # ---------- Java (Eclipse Temurin, selected major) ----------
+          $api = "https://api.adoptium.net/v3/assets/latest/$($env:JAVA_MAJOR)/hotspot?architecture=x64&image_type=jdk&os=windows&vendor=eclipse"
+          $asset = (Invoke-RestMethod $api -Headers $UA)[0]
+          $msi   = $asset.binary.installer.link
+          Write-Host ">>> Installing Temurin JDK $($asset.version.semver) ..." -ForegroundColor Cyan
+          Invoke-WebRequest $msi -OutFile "C:\jdk.msi" -Headers $UA
           Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
           Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
 
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          $jdkDir = Get-ChildItem "C:\Program Files\Eclipse Adoptium\jdk-*" -Directory |
+                    Where-Object { $_.Name -match "jdk-$($env:JAVA_MAJOR)[\.u\-]" -or $_.Name -match "jdk-$($env:JAVA_MAJOR)$" } |
+                    Select-Object -First 1
+          if (-not $jdkDir) { $jdkDir = Get-ChildItem "C:\Program Files\Eclipse Adoptium\jdk-*" -Directory | Select-Object -First 1 }
+          $javaExe = Join-Path $jdkDir.FullName 'bin\java.exe'
+          if (-not (Test-Path $javaExe)) { throw "java.exe not found after install." }
+          "JAVA_EXE=$javaExe" | Out-File $env:GITHUB_ENV -Append
+          "java_exe=$javaExe" | Out-File $env:GITHUB_OUTPUT -Append
 
-          Write-Host ""
+          # ---------- Python ----------
+          if ($env:PY_VERSION -ne 'none') {
+            Write-Host ">>> Installing Python $($env:PY_VERSION) ..." -ForegroundColor Cyan
+            $pyUrl = "https://www.python.org/ftp/python/$($env:PY_VERSION)/python-$($env:PY_VERSION)-amd64.exe"
+            Invoke-WebRequest $pyUrl -OutFile "C:\python-installer.exe"
+            Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
+            Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
+          }
+
+          $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> TOOLCHAIN INSTALL SUMMARY <<<" -ForegroundColor Cyan
-          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
-          if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
-          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
-          if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
-          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
+          Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
+          Write-Host "  Java : $(& $javaExe -version 2>&1 | Select-Object -First 1)" -ForegroundColor Yellow
+          Write-Host "  Path : $javaExe" -ForegroundColor Yellow
+          $py = (Get-Command python -ErrorAction SilentlyContinue).Source
+          if ($py) { Write-Host "  Python : $(& python --version 2>&1) ($py)" -ForegroundColor Yellow }
+          else     { Write-Host "  Python : not installed" -ForegroundColor DarkGray }
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Generate Optimized .rdp Connection File
+      # ───────────────────────────────────────────────────────
+      - name: 5. Install ${{ steps.resolve.outputs.server_label }} (MC ${{ steps.resolve.outputs.mc_version }})
+        if: steps.resolve.outputs.server_kind != 'none'
+        shell: pwsh
+        env:
+          SRV_URL:   ${{ steps.resolve.outputs.server_url }}
+          SRV_KIND:  ${{ steps.resolve.outputs.server_kind }}
+          SRV_TYPE:  ${{ steps.resolve.outputs.server_type }}
+          SRV_LABEL: ${{ steps.resolve.outputs.server_label }}
+          MC_VER:    ${{ steps.resolve.outputs.mc_version }}
+          RAM:       ${{ inputs.ram }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference    = 'SilentlyContinue'
+          $UA  = @{ 'User-Agent' = 'github-actions-rdp-workflow/1.0' }
+          $dir = $env:MC_SERVER_DIR
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          $java = $env:JAVA_EXE
+
+          # ---------- fetch / install ----------
+          if ($env:SRV_KIND -eq 'installer') {
+            Write-Host ">>> Downloading $($env:SRV_LABEL) installer ..." -ForegroundColor Cyan
+            Invoke-WebRequest $env:SRV_URL -OutFile "$dir\installer.jar" -Headers $UA
+            Write-Host ">>> Running --installServer (1-3 min) ..." -ForegroundColor Cyan
+            Push-Location $dir
+            & $java -jar "$dir\installer.jar" --installServer
+            $code = $LASTEXITCODE
+            Pop-Location
+            if ($code -ne 0) { throw "Installer exited with code $code." }
+            Remove-Item "$dir\installer.jar","$dir\installer.jar.log" -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host ">>> Downloading server jar ..." -ForegroundColor Cyan
+            Invoke-WebRequest $env:SRV_URL -OutFile "$dir\server.jar" -Headers $UA
+          }
+
+          Set-Content -Path "$dir\eula.txt" -Value "eula=true" -Encoding ASCII
+
+          # ---------- Aikar's flags (tuned per heap size) ----------
+          $gb = [int]($env:RAM -replace 'G','')
+          if ($gb -ge 12) {
+            $g1 = '-XX:G1NewSizePercent=40 -XX:G1MaxNewSizePercent=50 -XX:G1HeapRegionSize=16M -XX:G1ReservePercent=15 -XX:InitiatingHeapOccupancyPercent=20'
+          } else {
+            $g1 = '-XX:G1NewSizePercent=30 -XX:G1MaxNewSizePercent=40 -XX:G1HeapRegionSize=8M -XX:G1ReservePercent=20 -XX:InitiatingHeapOccupancyPercent=15'
+          }
+          $flags = "-XX:+UseG1GC -XX:+ParallelRefProcEnabled -XX:MaxGCPauseMillis=200 -XX:+UnlockExperimentalVMOptions -XX:+DisableExplicitGC -XX:+AlwaysPreTouch $g1 -XX:G1HeapWastePercent=5 -XX:G1MixedGCCountTarget=4 -XX:G1MixedGCLiveThresholdPercent=90 -XX:G1RSetUpdatingPauseTimePercent=5 -XX:SurvivorRatio=32 -XX:+PerfDisableSharedMem -XX:MaxTenuringThreshold=1 -Dusing.aikars.flags=https://mcflags.emc.gs -Daikars.new.flags=true"
+          $mem = "-Xms$($env:RAM) -Xmx$($env:RAM)"
+
+          # ---------- work out how this server is launched ----------
+          $argsFile = Get-ChildItem -Path "$dir\libraries" -Filter 'win_args.txt' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($argsFile) {
+            # Modern Forge / NeoForge (1.17+) : @user_jvm_args.txt @win_args.txt
+            $rel = $argsFile.FullName.Substring($dir.Length + 1)
+            (("$mem $flags") -split ' ') -join "`r`n" | Set-Content "$dir\user_jvm_args.txt" -Encoding ASCII
+            $launch = '"%JAVACMD%" @user_jvm_args.txt @' + $rel + ' nogui'
+            $jarName = "(modular launcher: $rel)"
+          } else {
+            $jar = Get-ChildItem "$dir\*.jar" -File |
+                   Where-Object { $_.Name -notmatch 'installer' } |
+                   Sort-Object @{ Expression = {
+                       if ($_.Name -match 'universal') { 0 }
+                       elseif ($_.Name -match '^(forge|neoforge|fabric|paper|purpur|server)') { 1 }
+                       elseif ($_.Name -match 'minecraft_server') { 2 }
+                       else { 3 } }; Descending = $false },
+                              @{ Expression = 'Length'; Descending = $true } |
+                   Select-Object -First 1
+            if (-not $jar) { throw "No runnable server jar found in $dir." }
+            $jarName = $jar.Name
+            $launch  = '"%JAVACMD%" ' + $mem + ' ' + $flags + ' -jar "' + $jarName + '" nogui'
+          }
+
+          # ---------- start.bat ----------
+          @(
+            '@echo off',
+            "title $($env:SRV_LABEL) - Minecraft $($env:MC_VER)",
+            'cd /d "%~dp0"',
+            "set `"JAVACMD=$java`"",
+            'if not exist "%JAVACMD%" goto nojava',
+            "echo Starting $($env:SRV_LABEL) on Minecraft $($env:MC_VER) with $($env:RAM) RAM ...",
+            $launch,
+            'echo.',
+            'echo Server stopped. Press any key to close.',
+            'pause >nul',
+            'exit /b 0',
+            ':nojava',
+            'echo ERROR: Java not found at "%JAVACMD%"',
+            'pause >nul',
+            'exit /b 1'
+          ) | Set-Content -Path "$dir\start.bat" -Encoding ASCII
+
+          # ---------- desktop shortcut ----------
+          try {
+            $ws = New-Object -ComObject WScript.Shell
+            $sc = $ws.CreateShortcut("C:\Users\Public\Desktop\Minecraft Server.lnk")
+            $sc.TargetPath       = "$dir\start.bat"
+            $sc.WorkingDirectory = $dir
+            $sc.IconLocation     = "$java,0"
+            $sc.Description      = "$($env:SRV_LABEL) - Minecraft $($env:MC_VER)"
+            $sc.Save()
+          } catch { Write-Host "Shortcut skipped: $_" -ForegroundColor Yellow }
+
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> MINECRAFT SERVER READY <<<"                   -ForegroundColor Cyan
+          Write-Host "  Software : $($env:SRV_LABEL)"                     -ForegroundColor Yellow
+          Write-Host "  Version  : $($env:MC_VER)"                        -ForegroundColor Yellow
+          Write-Host "  Folder   : $dir"                                  -ForegroundColor Yellow
+          Write-Host "  Launcher : $dir\start.bat  ($jarName)"            -ForegroundColor Yellow
+          Write-Host "  Memory   : $mem"                                  -ForegroundColor Yellow
+          Write-Host "  EULA     : accepted"                              -ForegroundColor Yellow
+          Write-Host "  >> RDP in and double-click 'Minecraft Server' on the desktop." -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
+
+      # ───────────────────────────────────────────────────────
+      - name: 5b. Auto-start server (headless)
+        if: inputs.autostart_server && steps.resolve.outputs.server_kind != 'none'
+        shell: pwsh
+        run: |
+          $dir = $env:MC_SERVER_DIR
+          New-Item -ItemType Directory -Path "$dir\logs" -Force | Out-Null
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$dir\start.bat`"" -WorkingDirectory $dir `
+            -RedirectStandardOutput "$dir\logs\console.log" -RedirectStandardError "$dir\logs\console-err.log"
+          Start-Sleep -Seconds 45
+          Write-Host ">>> First 60 lines of console.log:" -ForegroundColor Cyan
+          Get-Content "$dir\logs\console.log" -TotalCount 60 -ErrorAction SilentlyContinue
+          Write-Host ">>> Server launched in the background. Full log: $dir\logs\console.log" -ForegroundColor Green
+          Write-Host ">>> Note: it runs detached, so no console window appears in the RDP session." -ForegroundColor DarkGray
+
+      # ───────────────────────────────────────────────────────
+      - name: 6. Generate Optimized .rdp Connection File
+        shell: pwsh
+        env:
+          QUALITY: ${{ inputs.rdp_quality }}
         run: |
           $ts_ip = (& "C:\Program Files\Tailscale\tailscale.exe" ip -4).Trim()
+
+          # connection type 6 = "LAN (10 Mbps or higher with high latency)".
+          # This is the FAST profile: it stops the client asking the server to
+          # degrade quality. The old "connection type:i:1" was the 56k-modem
+          # profile, which throttles everything on purpose.
+          switch ($env:QUALITY) {
+            'performance' { $w=1366; $h=768;  $bpp=16; $fx=1; $font=0; $audio=2 }
+            'balanced'    { $w=1600; $h=900;  $bpp=24; $fx=1; $font=1; $audio=0 }
+            'quality'     { $w=1920; $h=1080; $bpp=32; $fx=0; $font=1; $audio=0 }
+          }
+
           $lines = @(
             "full address:s:$ts_ip",
-            "username:s:CynetAdmin",
+            "username:s:$env:RDP_USER",
             "prompt for credentials:i:0",
             "authentication level:i:0",
+            "enablecredsspsupport:i:1",
             "screen mode id:i:2",
-            "desktopwidth:i:1600",
-            "desktopheight:i:900",
-            "session bpp:i:24",
+            "desktopwidth:i:$w",
+            "desktopheight:i:$h",
+            "session bpp:i:$bpp",
             "compression:i:1",
             "keyboardhook:i:2",
+            # --- speed: let RDP use UDP + adapt, on a LAN-class profile -----
+            "connection type:i:6",
+            "networkautodetect:i:1",
+            "bandwidthautodetect:i:1",
+            "videoplaybackmode:i:1",
+            "redirectdirectx:i:1",
+            "bitmapcachepersistenable:i:1",
+            "bitmapcachesize:i:32000",
+            "autoreconnection enabled:i:1",
+            "disableconnectionsharing:i:0",
+            # --- fewer virtual channels = less overhead ---------------------
+            "audiomode:i:$audio",
             "audiocapturemode:i:0",
-            "audiomode:i:0",
             "redirectprinters:i:0",
-            "redirectclipboard:i:1",
             "redirectcomports:i:0",
             "redirectsmartcards:i:0",
+            "redirectlocation:i:0",
+            "redirectwebauthn:i:0",
+            "devicestoredirect:s:",
+            "drivestoredirect:s:",
+            "usbdevicestoredirect:s:",
+            "redirectclipboard:i:1",
+            # --- eye candy ---------------------------------------------------
             "displayconnectionbar:i:1",
             "use multimon:i:0",
-            "videoplaybackmode:i:1",
-            "bandwidthautodetect:i:1",
-            "networkautodetect:i:1",
-            "connection type:i:7",
-            "disable wallpaper:i:1",
-            "disable full window drag:i:1",
-            "disable menu anims:i:1",
-            "allow font smoothing:i:0",
-            "bitmapcachepersistenable:i:1"
+            "disable themes:i:$fx",
+            "disable wallpaper:i:$fx",
+            "disable full window drag:i:$fx",
+            "disable menu anims:i:$fx",
+            "disable cursor setting:i:$fx",
+            "allow font smoothing:i:$font",
+            "allow desktop composition:i:$(1 - $fx)"
           )
           $rdp = $lines -join "`r`n"
           $rdp | Out-File -FilePath "./optimized-connection.rdp" -Encoding ASCII
           Write-Host $rdp
-          Write-Host ">>> Saved optimized-connection.rdp for IP $ts_ip" -ForegroundColor Green
+          Write-Host ""
+          Write-Host ">>> Saved optimized-connection.rdp - $env:QUALITY profile, ${w}x${h}@${bpp}bpp, LAN profile + UDP" -ForegroundColor Green
 
-      - name: 6. Upload Optimized .rdp File
+      - name: 7. Upload Optimized .rdp File
         uses: actions/upload-artifact@v4
         with:
           name: optimized-rdp-connection
           path: ./optimized-connection.rdp
 
-      - name: 7. Keep Server Alive (6 Hours)
+      # ───────────────────────────────────────────────────────
+      - name: 8. Keep Server Alive (${{ inputs.keep_alive_hours }} h)
+        shell: pwsh
+        env:
+          HOURS: ${{ inputs.keep_alive_hours }}
         run: |
-          for ($i = 1; $i -le 999; $i++) {
+          $total = [int]([double]$env:HOURS * 60)
+          Write-Host ">>> Holding the runner for $total minutes ($env:HOURS h)." -ForegroundColor Green
+          for ($i = 1; $i -le $total; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/999] Server running..."
+            if ($i % 5 -eq 0 -or $i -eq 1) {
+              $left = $total - $i
+              Write-Host "[$i/$total] Server running... ($left min left)"
+            }
           }
+          Write-Host ">>> Keep-alive finished - the runner will now shut down." -ForegroundColor Yellow
