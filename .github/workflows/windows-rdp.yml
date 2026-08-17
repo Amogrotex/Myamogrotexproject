@@ -65,12 +65,34 @@ jobs:
           & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
                    --reset --netfilter-mode=off --ssh=false --accept-dns=false
 
-          # Poll for IPv4 every 0.5s (was 2s) = connects up to 4x faster
+          # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
+          # while tailscaled finishes starting up)
           $ts_ip = $null
-          for ($i = 0; $i -lt 40; $i++) {
-            $ts_ip = (& $ts ip -4 2>$null | Select-Object -First 1).Trim()
-            if ($ts_ip) { break }
+          for ($i = 1; $i -le 40; $i++) {
+            $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if ($raw) {
+              $ts_ip = ([string]$raw).Trim()
+              break
+            }
             Start-Sleep -Milliseconds 500
+          }
+
+          # Fallback 1: read the IP from 'status --json' (works even while the
+          # 'ip' subcommand misbehaves)
+          if (-not $ts_ip) {
+            try {
+              $stSelf = & $ts status --json 2>$null | ConvertFrom-Json
+              if ($stSelf.Self.TailscaleIPs) {
+                $ts_ip = [string]$stSelf.Self.TailscaleIPs[0]
+              }
+            } catch { }
+          }
+
+          # Fallback 2: show unfiltered diagnostics instead of failing silently
+          if (-not $ts_ip) {
+            Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
+            & $ts status
+            & $ts ip -4
           }
 
           # Fast relay check via JSON (no slow netcheck probes)
