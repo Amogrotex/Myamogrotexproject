@@ -37,33 +37,52 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
 
-      - name: 3. Install & Connect Tailscale VPN (optimized)
+      - name: 3a. Cache Tailscale Installer (skip re-download every run)
+        id: ts-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\tailscale.msi
+          key: tailscale-msi-v1
+
+      - name: 3b. Install & Connect Tailscale (optimized)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          Invoke-WebRequest "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile "C:\tailscale.msi"
+          # Kill PowerShell's progress bar rendering -> 5-10x faster downloads
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Download only on cache miss (curl.exe is much faster than Invoke-WebRequest)
+          if (-not (Test-Path "C:\tailscale.msi")) {
+            curl.exe -L --retry 3 --retry-delay 2 -o "C:\tailscale.msi" "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          }
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
 
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          Start-Sleep -Seconds 4
 
-          # --reset clears stale state on re-deploys; --accept-routes enables subnet routing
-          & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" --accept-routes --reset
+          # --reset clears stale state; skip features we don't use = faster startup
+          # --netfilter-mode=off : no WFP firewall hooks = lower per-packet overhead + no rule conflicts with RDP
+          # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
+          & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
+                   --reset --netfilter-mode=off --ssh=false --accept-dns=false
 
-          # Wait until a Tailscale IPv4 is assigned (faster + reliable than a fixed sleep)
+          # Poll for IPv4 every 0.5s (was 2s) = connects up to 4x faster
           $ts_ip = $null
-          for ($i = 0; $i -lt 30; $i++) {
-            $ts_ip = (& $ts ip -4 2>$null)
+          for ($i = 0; $i -lt 40; $i++) {
+            $ts_ip = (& $ts ip -4 2>$null | Select-Object -First 1).Trim()
             if ($ts_ip) { break }
-            Start-Sleep -Seconds 2
+            Start-Sleep -Milliseconds 500
           }
 
-          # Diagnostics: direct vs relayed (relay = slow)
-          Write-Host ""
-          Write-Host ">>> Tailscale netcheck (NAT type + DERP relay latency):" -ForegroundColor Cyan
-          & $ts netcheck
-          Write-Host ">>> Tailscale status (peer should say 'direct', NOT 'relay'/'derp'):" -ForegroundColor Cyan
-          & $ts status
+          # Fast relay check via JSON (no slow netcheck probes)
+          $direct = $false
+          try {
+            $st = & $ts status --json 2>$null | ConvertFrom-Json
+            $peer = $st.Peer.Values | Select-Object -First 1
+            if ($peer) {
+              $direct = [string]::IsNullOrEmpty([string]$peer.Relay)
+              $derp  = if ($peer.Relay) { $peer.Relay } else { "direct (no relay)" }
+            }
+          } catch { }
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
@@ -71,11 +90,27 @@ jobs:
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
           Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  >> Download the optimized .rdp artifact, or mstsc to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
+          if (-not $direct) {
+            Write-Host "  WARN: relayed connection will be slow. Tips below." -ForegroundColor Red
+          }
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
+
+          # If relayed, help the user fix it
+          if (-not $direct) {
+            Write-Host ""
+            Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
+            Write-Host " 1. Install Tailscale on YOUR PC too and log into the same account (tailscale.com/download)"
+            Write-Host " 2. Check 'tailscale status' on your PC - both machines should show 'direct'"
+            Write-Host " 3. Relayed usually means: closed UDP port 41641, CGNAT, or strict corporate firewall"
+            Write-Host " 4. On your PC: tailscale up --netfilter-mode=off  (removes firewall overhead)"
+            Write-Host " 5. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
+          }
 
       - name: 4. Install Python & Java (Adoptium Temurin 21)
         run: |
+          $ProgressPreference = 'SilentlyContinue'
           Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
           Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
           Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
@@ -99,53 +134,7 @@ jobs:
           Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Generate Optimized .rdp Connection File
-        run: |
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          $ts_ip = (& $ts ip -4 2>$null).Trim()
-          $lines = @(
-            "full address:s:$ts_ip",
-            "username:s:CynetAdmin",
-            "prompt for credentials:i:0",
-            "authentication level:i:0",
-            "screen mode id:i:2",
-            "desktopwidth:i:1280",
-            "desktopheight:i:720",
-            "session bpp:i:16",
-            "compression:i:1",
-            "keyboardhook:i:2",
-            "audiocapturemode:i:0",
-            "audiomode:i:0",
-            "redirectprinters:i:0",
-            "redirectclipboard:i:1",
-            "redirectcomports:i:0",
-            "redirectsmartcards:i:0",
-            "displayconnectionbar:i:1",
-            "use multimon:i:0",
-            "videoplaybackmode:i:1",
-            "bandwidthautodetect:i:0",
-            "networkautodetect:i:0",
-            "connection type:i:1",
-            "disable themes:i:1",
-            "disable wallpaper:i:1",
-            "disable full window drag:i:1",
-            "disable menu anims:i:1",
-            "disable cursor setting:i:1",
-            "allow font smoothing:i:0",
-            "bitmapcachepersistenable:i:1"
-          )
-          $rdp = $lines -join "`r`n"
-          $rdp | Out-File -FilePath "./optimized-connection.rdp" -Encoding ASCII
-          Write-Host $rdp
-          Write-Host ">>> Saved optimized-connection.rdp for IP $ts_ip" -ForegroundColor Green
-
-      - name: 6. Upload Optimized .rdp File
-        uses: actions/upload-artifact@v4
-        with:
-          name: optimized-rdp-connection
-          path: ./optimized-connection.rdp
-
-      - name: 7. Keep Server Alive (6 Hours)
+      - name: 5. Keep Server Alive (6 Hours)
         run: |
           for ($i = 1; $i -le 999; $i++) {
             Start-Sleep -Seconds 60
