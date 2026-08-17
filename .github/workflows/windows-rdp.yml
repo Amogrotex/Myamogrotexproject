@@ -60,10 +60,17 @@ jobs:
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
 
           # --reset clears stale state; skip features we don't use = faster startup
-          # --netfilter-mode=off : no WFP firewall hooks = lower per-packet overhead + no rule conflicts with RDP
           # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
+          # NOTE: --netfilter-mode was REMOVED from current Tailscale Windows builds,
+          # so it is intentionally not used here.
           & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
-                   --reset --netfilter-mode=off --ssh=false --accept-dns=false
+                   --reset --ssh=false --accept-dns=false
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host ">>> tailscale up FAILED (exit code $LASTEXITCODE)." -ForegroundColor Red
+            Write-Host "    Check that TAILSCALE_AUTHKEY secret is set, valid and reusable:" -ForegroundColor Red
+            Write-Host "    https://login.tailscale.com/admin/settings/keys" -ForegroundColor Red
+            throw "Tailscale login failed - job aborted."
+          }
 
           # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
           # while tailscaled finishes starting up)
