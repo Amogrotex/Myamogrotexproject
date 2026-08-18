@@ -6,7 +6,7 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    # GitHub Actions hard cap: 360 min (6 h) for standard runners
+    # GitHub Actions hard cap: 360 min (6 h) for free-tier runners
     timeout-minutes: 360
 
     steps:
@@ -14,7 +14,6 @@ jobs:
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
@@ -22,14 +21,14 @@ jobs:
           # --- RDP performance tuning (server-side) ---
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $tsPol -Force | Out-Null
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force     # UDP+TCP
           Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
 
-          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
+          # --- High Performance power plan (no CPU throttling) ---
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
 
-          Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
+          Write-Host ">>> RDP enabled (UDP+TCP transport) + High Performance power plan." -ForegroundColor Green
 
       - name: 2. Create Admin Account
         run: |
@@ -37,199 +36,149 @@ jobs:
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
+          Write-Host ">>> Account CynetAdmin created / runneradmin password set." -ForegroundColor Green
 
-      - name: 3a. Cache cloudflared binary
-        id: cf-cache
-        uses: actions/cache@v4
-        with:
-          path: C:\cloudflared.exe
-          key: cloudflared-exe-v2
-
-      # ---------------------------------------------------------------
-      # OPTIONAL — Named-tunnel mode (stable hostname, no random URL):
-      #   1. Sign up at https://dash.teams.cloudflare.com/ (free)
-      #   2. Networks → Tunnels → Create a tunnel → choose "Cloudflared"
-      #   3. Copy the token, add it as a repo secret named CF_TUNNEL_TOKEN
-      #   4. In Zero Trust, add a Public Hostname for the tunnel:
-      #        Sub/Domain: e.g. rdp.yourdomain.com
-      #        Type:  RDP
-      #        URL:   localhost:3389
-      #   5. Uncomment the env: block below and delete step 3c.
-      # ---------------------------------------------------------------
-      - name: 3b. Download cloudflared
+      # ============================================================
+      # Step 3: download cloudflared → start Quick Tunnel → print
+      # connection info → KEEP THE SERVER ALIVE (watchdog loop).
+      # Everything runs in ONE PowerShell process so cloudflared is
+      # never orphaned/killed between steps (which caused Error 1033).
+      # ============================================================
+      - name: 3. Start Cloudflare Tunnel & Keep Server Alive
         run: |
           $ProgressPreference = 'SilentlyContinue'
+          $ErrorActionPreference = 'Continue'
 
+          # ---- 3a. Cache / download cloudflared ---------------------------------
           if (-not (Test-Path "C:\cloudflared.exe")) {
-            Write-Host ">>> Downloading cloudflared (latest stable)..." -ForegroundColor Cyan
+            Write-Host ">>> Downloading cloudflared (latest stable Windows amd64)..." -ForegroundColor Cyan
             curl.exe -L --retry 3 --retry-delay 2 -o "C:\cloudflared.exe" `
               "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           } else {
-            Write-Host ">>> Using cached cloudflared.exe" -ForegroundColor Cyan
+            Write-Host ">>> Using cached C:\cloudflared.exe" -ForegroundColor Cyan
           }
           & "C:\cloudflared.exe" --version
 
-      - name: 3c. Launch Cloudflare Quick Tunnel (RDP over TCP) — NO account needed
-        # If you use a Named Tunnel (see step 3a notes), REPLACE this entire step
-        # with:
-        #
-        #   - name: 3c-alt. Named Tunnel (stable hostname)
-        #     env:
-        #       CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
-        #     run: |
-        #       Start-Process -FilePath "C:\cloudflared.exe" `
-        #         -ArgumentList 'tunnel','--no-autoupdate','run','--token',"$Env:CF_TUNNEL_TOKEN" `
-        #         -WindowStyle Hidden -PassThru | Out-Null
-        #       # Hostname is whatever you set in Zero Trust → Tunnels → Public Hostname
-        #       $cfHost = "rdp.yourdomain.com"
-        #       Write-Host "CF_HOST=$cfHost"        | Out-File $env:GITHUB_ENV -Append
-        #       Write-Host "CF_NAMED=true"          | Out-File $env:GITHUB_ENV -Append
-        #       Write-Host ">>> Named tunnel running. Hostname: $cfHost" -ForegroundColor Green
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Remove-Item Env:CF_NAMED -ErrorAction SilentlyContinue
-
-          # Launch cloudflared in the background, logging to two separate files.
-          # (PowerShell Start-Process refuses to share one file for both streams.)
-          # Quick Tunnel = no Cloudflare account, no domain, no token.
-          # Use tcp:// so any local TCP-speaking service (RDP here) is proxied.
+          # ---- 3b. Start cloudflared as a fully detached background process -----
+          # Use -WindowStyle Hidden (NOT -NoNewWindow) so the process owns its own
+          # console and can't be killed when PowerShell moves between commands.
           $logOut = "C:\cloudflared.out.log"
           $logErr = "C:\cloudflared.err.log"
           foreach ($f in $logOut,$logErr) { if (Test-Path $f) { Remove-Item $f -Force } }
 
+          # Quick Tunnel (tcp://) — no Cloudflare account, no token, no domain.
+          # --protocol auto lets cloudflared pick QUIC (UDP 7844) first, falling
+          # back to HTTP/2 if outbound UDP is blocked.
+          $args = @(
+            'tunnel',
+            '--no-autoupdate',
+            '--edge-ip-version', 'auto',
+            '--retries', '20',
+            '--protocol', 'auto',
+            '--url', 'tcp://localhost:3389'
+          )
+
           $cfProc = Start-Process -FilePath "C:\cloudflared.exe" `
-            -ArgumentList 'tunnel','--no-autoupdate','--url','tcp://localhost:3389' `
+            -ArgumentList $args `
             -RedirectStandardOutput $logOut -RedirectStandardError $logErr `
-            -PassThru -NoNewWindow
+            -WindowStyle Hidden -PassThru
 
-          Write-Host ">>> cloudflared started (PID $($cfProc.Id)). Waiting for tunnel URL..." -ForegroundColor Cyan
+          Write-Host ">>> cloudflared launched (PID $($cfProc.Id)). Waiting for tunnel URL..." -ForegroundColor Cyan
 
-          # Helper that concatenates both logs (cloudflared prints the URL to stdout)
+          # Helper: combined log view
           function Get-CfLogs {
-            $out = if (Test-Path $logOut) { Get-Content $logOut -ErrorAction SilentlyContinue } else { @() }
-            $err = if (Test-Path $logErr) { Get-Content $logErr -ErrorAction SilentlyContinue } else { @() }
+            $out = if (Test-Path $logOut) { @(Get-Content $logOut -ErrorAction SilentlyContinue) } else { @() }
+            $err = if (Test-Path $logErr) { @(Get-Content $logErr -ErrorAction SilentlyContinue) } else { @() }
             return @($out + $err)
           }
 
-          # Poll the logs until cloudflared prints its *.trycloudflare.com hostname
+          # ---- 3c. Wait for *.trycloudflare.com URL to appear -------------------
           $cfUrl = $null
-          for ($i = 1; $i -le 90; $i++) {
+          for ($i = 1; $i -le 120; $i++) {
+            if ($cfProc.HasExited) {
+              Write-Host ">>> cloudflared exited prematurely (code $($cfProc.ExitCode))." -ForegroundColor Red
+              Write-Host "--- stdout ---"; if (Test-Path $logOut) { Get-Content $logOut -Tail 60 }
+              Write-Host "--- stderr ---"; if (Test-Path $logErr) { Get-Content $logErr -Tail 60 }
+              throw "cloudflared failed at startup."
+            }
             $all = Get-CfLogs
             if ($all.Count -gt 0) {
-              # cloudflared prints the URL in a line like:
-              #   "+----------------------------+-------------+",
-              #   "|  https://random.trycloudflare.com       |"
-              # Or: "... https://<id>.trycloudflare.com ..."
-              $m = ($all -join "`n") | Select-String -Pattern 'https://[a-z0-9\-]+\.trycloudflare\.com' -AllMatches
-              if ($m) {
-                $cfUrl = $m.Matches[0].Value
-                break
-              }
+              $blob = $all -join "`n"
+              # Match URLs inside the ASCII box banner OR inline text
+              $m = [regex]::Match($blob, 'https://[a-z0-9][a-z0-9\-]*\.trycloudflare\.com')
+              if ($m.Success) { $cfUrl = $m.Value; break }
             }
             Start-Sleep -Seconds 1
           }
 
           if (-not $cfUrl) {
-            Write-Host ">>> ERROR: Cloudflare Quick Tunnel did not start in time." -ForegroundColor Red
-            Write-Host "--- cloudflared stdout tail ---" -ForegroundColor Yellow
-            if (Test-Path $logOut) { Get-Content $logOut -Tail 60 }
-            Write-Host "--- cloudflared stderr tail ---" -ForegroundColor Yellow
-            if (Test-Path $logErr) { Get-Content $logErr -Tail 60 }
-            throw "cloudflared failed to register tunnel."
+            Write-Host ">>> ERROR: Timed out waiting for Quick Tunnel URL." -ForegroundColor Red
+            Write-Host "--- stdout ---"; if (Test-Path $logOut) { Get-Content $logOut -Tail 80 }
+            Write-Host "--- stderr ---"; if (Test-Path $logErr) { Get-Content $logErr -Tail 80 }
+            throw "cloudflared did not register a tunnel."
           }
 
           $cfHost = $cfUrl -replace '^https?://',''
-          Write-Host "CF_URL=$cfUrl"   | Out-File $env:GITHUB_ENV -Append
-          Write-Host "CF_HOST=$cfHost" | Out-File $env:GITHUB_ENV -Append
-          # Persist log paths for later steps
-          "C:\cloudflared.out.log" | Out-File "C:\cloudflared.logpath.out" -NoNewline
-          "C:\cloudflared.err.log" | Out-File "C:\cloudflared.logpath.err" -NoNewline
 
-          # Save PID so the keep-alive can watchdog it
-          $cfProc.Id | Out-File "C:\cloudflared.pid" -NoNewline
+          # ---- 3d. Warm-up pause: wait for Cloudflare edge to propagate ---------
+          Write-Host ">>> Got URL: $cfUrl — giving Cloudflare edge a few seconds to propagate..." -ForegroundColor Cyan
+          Start-Sleep -Seconds 8
 
+          # ---- 3e. Print connection banner --------------------------------------
           Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! (Cloudflare Quick Tunnel)" -ForegroundColor Cyan
-          Write-Host "  Tunnel URL  : $cfUrl" -ForegroundColor Yellow
-          Write-Host "  Username    : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password    : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "==========================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY! (Cloudflare Quick Tunnel) <<<"   -ForegroundColor Cyan
+          Write-Host "  Tunnel Host : $cfHost"                                    -ForegroundColor Yellow
+          Write-Host "  Username    : CynetAdmin"                                 -ForegroundColor Yellow
+          Write-Host "  Password    : Cynet@2026"                                 -ForegroundColor Yellow
+          Write-Host "==========================================================" -ForegroundColor Green
           Write-Host ""
           Write-Host ">>> HOW TO CONNECT FROM YOUR PC:" -ForegroundColor Magenta
           Write-Host ""
-          Write-Host " 1) Download cloudflared for Windows (single ~25 MB exe):" -ForegroundColor White
-          Write-Host "    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          Write-Host "    Put it in a folder on your PATH (e.g. C:\Windows\System32\cloudflared.exe)"
+          Write-Host "  1) Download cloudflared (single ~25 MB exe, no installer):"
+          Write-Host "     https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Write-Host "     Put it on your PATH (e.g. drop it in C:\Windows\System32\)."
           Write-Host ""
-          Write-Host " 2) Open PowerShell / cmd and run (leave this window OPEN):" -ForegroundColor White
-          Write-Host "    cloudflared access tcp --hostname $cfHost --url localhost:3389" -ForegroundColor Yellow
+          Write-Host "  2) Open PowerShell/cmd and run (LEAVE THIS WINDOW OPEN):" -ForegroundColor White
+          Write-Host "     cloudflared access tcp --hostname $cfHost --url localhost:3389" -ForegroundColor Yellow
           Write-Host ""
-          Write-Host " 3) Open mstsc.exe and connect to:" -ForegroundColor White
-          Write-Host "    localhost:3389" -ForegroundColor Yellow
+          Write-Host "  3) Open mstsc.exe and connect to:  localhost:3389" -ForegroundColor White
+          Write-Host "     Log in with user CynetAdmin / password Cynet@2026"
           Write-Host ""
-          Write-Host " 4) Log in with user = CynetAdmin, password = Cynet@2026" -ForegroundColor White
+          Write-Host "  4) When done, close the cloudflared window and cancel this workflow run."
           Write-Host ""
-          Write-Host " NOTE: Cloudflare does NOT expose raw RDP directly on the free tier;"
-          Write-Host "       cloudflared on your PC acts as a local TCP proxy into the tunnel."
-          Write-Host "       Close the cloudflared window when you're done."
+          Write-Host ">>> Tunnel uptime will be reported in this log every 10 minutes." -ForegroundColor DarkGray
+          Write-Host ""
 
-      - name: 4. Install Python & Java (Adoptium Temurin 21)
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
-          curl.exe -L --retry 3 -o "C:\python-installer.exe" "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe"
-          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
-          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
-
-          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
-          curl.exe -L --retry 3 -o "C:\jdk.msi" "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse"
-          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
-          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
-
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
-          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
-          if ($pyPath) { Write-Host "  Python    : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Python    : NOT FOUND on PATH" -ForegroundColor Red }
-          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
-          if ($javaPath) { Write-Host "  Java      : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
-          else           { Write-Host "  Java      : NOT FOUND on PATH" -ForegroundColor Red }
-          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
-          Write-Host "==================================================" -ForegroundColor Green
-
-      - name: 5. Keep Server Alive (up to 6 h)
-        run: |
-          Write-Host ">>> Server alive loop starting. Max 6 h (GitHub Actions runner cap)." -ForegroundColor Cyan
-          $logOut = if (Test-Path "C:\cloudflared.logpath.out") { (Get-Content "C:\cloudflared.logpath.out") } else { "C:\cloudflared.out.log" }
-          $logErr = if (Test-Path "C:\cloudflared.logpath.err") { (Get-Content "C:\cloudflared.logpath.err") } else { "C:\cloudflared.err.log" }
-          for ($i = 1; $i -le 355; $i++) {
+          # ---- 3f. Keep-alive + watchdog loop (one step = no cleanup kills) -----
+          # GitHub Actions caps Windows jobs at 360 minutes; we loop 1-minute ticks.
+          Write-Host ">>> Starting keep-alive loop (max ~6 h)." -ForegroundColor Cyan
+          $maxMin = 355
+          for ($i = 1; $i -le $maxMin; $i++) {
             Start-Sleep -Seconds 60
 
-            # Check cloudflared is still running; if not, bail out with logs
-            $pidFile = "C:\cloudflared.pid"
-            if (Test-Path $pidFile) {
-              $cfPid = [int](Get-Content $pidFile)
-              $proc = Get-Process -Id $cfPid -ErrorAction SilentlyContinue
-              if (-not $proc) {
-                Write-Host ">>> [$i/355] !! cloudflared (PID $cfPid) DIED." -ForegroundColor Red
-                Write-Host "--- cloudflared stdout tail ---"
-                if (Test-Path $logOut) { Get-Content $logOut -Tail 40 }
-                Write-Host "--- cloudflared stderr tail ---"
-                if (Test-Path $logErr) { Get-Content $logErr -Tail 40 }
-                throw "cloudflared process died — tunnel is down."
-              }
+            # Watchdog: if cloudflared dies, dump logs and fail loudly
+            if ($cfProc.HasExited) {
+              Write-Host ">>> [$i/$maxMin] !! cloudflared (PID $($cfProc.Id)) DIED (exit $($cfProc.ExitCode))." -ForegroundColor Red
+              Write-Host "--- stdout tail ---"; if (Test-Path $logOut) { Get-Content $logOut -Tail 50 }
+              Write-Host "--- stderr tail ---"; if (Test-Path $logErr) { Get-Content $logErr -Tail 50 }
+              throw "cloudflared died — tunnel is down."
             }
 
-            # Print a heartbeat + small log tail every 10 minutes
+            # Heartbeat every 10 minutes
             if ($i % 10 -eq 0) {
-              Write-Host "[$i/355] Server running... ($($i) min uptime)" -ForegroundColor Green
-              Write-Host "--- cloudflared tail (last 5 lines stdout/stderr) ---"
-              if (Test-Path $logOut) { Get-Content $logOut -Tail 3 }
-              if (Test-Path $logErr) { Get-Content $logErr -Tail 2 }
+              # Light activity to keep RDP session from idling out
+              Write-Host "[$i/$maxMin] Alive ($($i) min uptime) — PID $($cfProc.Id) still running." -ForegroundColor Green
+              if (Test-Path $logErr) {
+                $recentErr = Get-Content $logErr -Tail 3 -ErrorAction SilentlyContinue
+                if ($recentErr -and ($recentErr -match 'error|ERR|fail|disconnect|reconnect' -join '|')) {
+                  Write-Host "--- recent stderr ---" -ForegroundColor Yellow
+                  $recentErr | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+                }
+              }
             } else {
-              Write-Host "[$i/355] Server running..."
+              Write-Host "[$i/$maxMin] tick"
             }
           }
+
+          Write-Host ">>> Reached 6-hour cap. Exiting normally." -ForegroundColor Cyan
