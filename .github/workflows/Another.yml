@@ -1,4 +1,4 @@
-name: Windows Cloud RDP (Cloudflared)
+name: Windows Cloud RDP (via Cloudflare Tunnel)
 
 on:
   workflow_dispatch:
@@ -6,28 +6,30 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 480   # 8 hours max
+    # GitHub Actions hard cap: 360 min (6 h) for standard runners
+    timeout-minutes: 360
 
     steps:
       - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-          # RDP Performance Tuning
+          # --- RDP performance tuning (server-side) ---
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $tsPol -Force | Out-Null
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
           Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
 
-          # High Performance power plan
+          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
 
-          Write-Host ">>> RDP enabled with performance tuning." -ForegroundColor Green
+          Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
 
       - name: 2. Create Admin Account
         run: |
@@ -36,69 +38,173 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
 
-          Write-Host ">>> Admin account 'CynetAdmin' created." -ForegroundColor Green
+      - name: 3a. Cache cloudflared binary
+        id: cf-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\cloudflared.exe
+          key: cloudflared-exe-v2
 
-      - name: 3. Install & Run Cloudflared Tunnel
-        env:
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+      # ---------------------------------------------------------------
+      # OPTIONAL — Named-tunnel mode (stable hostname, no random URL):
+      #   1. Sign up at https://dash.teams.cloudflare.com/ (free)
+      #   2. Networks → Tunnels → Create a tunnel → choose "Cloudflared"
+      #   3. Copy the token, add it as a repo secret named CF_TUNNEL_TOKEN
+      #   4. In Zero Trust, add a Public Hostname for the tunnel:
+      #        Sub/Domain: e.g. rdp.yourdomain.com
+      #        Type:  RDP
+      #        URL:   localhost:3389
+      #   5. Uncomment the env: block below and delete step 3c.
+      # ---------------------------------------------------------------
+      - name: 3b. Download cloudflared
         run: |
           $ProgressPreference = 'SilentlyContinue'
 
-          Write-Host ">>> Downloading cloudflared..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
+          if (-not (Test-Path "C:\cloudflared.exe")) {
+            Write-Host ">>> Downloading cloudflared (latest stable)..." -ForegroundColor Cyan
+            curl.exe -L --retry 3 --retry-delay 2 -o "C:\cloudflared.exe" `
+              "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          } else {
+            Write-Host ">>> Using cached cloudflared.exe" -ForegroundColor Cyan
+          }
+          & "C:\cloudflared.exe" --version
 
-          Write-Host ">>> Starting Cloudflare Tunnel for RDP (Port 3389)..." -ForegroundColor Cyan
-          
-          # Run cloudflared in background
-          Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList "tunnel --no-autoupdate --url tcp://localhost:3389 --token $Env:CLOUDFLARE_TUNNEL_TOKEN" -NoNewWindow
+      - name: 3c. Launch Cloudflare Quick Tunnel (RDP over TCP) — NO account needed
+        # If you use a Named Tunnel (see step 3a notes), REPLACE this entire step
+        # with:
+        #
+        #   - name: 3c-alt. Named Tunnel (stable hostname)
+        #     env:
+        #       CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+        #     run: |
+        #       Start-Process -FilePath "C:\cloudflared.exe" `
+        #         -ArgumentList 'tunnel','--no-autoupdate','run','--token',"$Env:CF_TUNNEL_TOKEN" `
+        #         -WindowStyle Hidden -PassThru | Out-Null
+        #       # Hostname is whatever you set in Zero Trust → Tunnels → Public Hostname
+        #       $cfHost = "rdp.yourdomain.com"
+        #       Write-Host "CF_HOST=$cfHost"        | Out-File $env:GITHUB_ENV -Append
+        #       Write-Host "CF_NAMED=true"          | Out-File $env:GITHUB_ENV -Append
+        #       Write-Host ">>> Named tunnel running. Hostname: $cfHost" -ForegroundColor Green
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Remove-Item Env:CF_NAMED -ErrorAction SilentlyContinue
 
-          Start-Sleep -Seconds 8
+          # Launch cloudflared in the background, logging to a file.
+          # Quick Tunnel = no Cloudflare account, no domain, no token.
+          # Use tcp:// so any local TCP-speaking service (RDP here) is proxied.
+          $log = "C:\cloudflared.log"
+          if (Test-Path $log) { Remove-Item $log -Force }
 
-          # Get the tunnel URL
-          $tunnelUrl = $null
-          for ($i = 1; $i -le 15; $i++) {
-              $log = Get-Content "$env:USERPROFILE\.cloudflared\cloudflared.log" -ErrorAction SilentlyContinue -Raw
-              if ($log -match "https?://([\w-]+)\.trycloudflare\.com") {
-                  $tunnelUrl = $matches[0]
-                  break
+          $cfProc = Start-Process -FilePath "C:\cloudflared.exe" `
+            -ArgumentList 'tunnel','--no-autoupdate','--url','tcp://localhost:3389' `
+            -RedirectStandardOutput $log -RedirectStandardError $log `
+            -PassThru -NoNewWindow
+
+          Write-Host ">>> cloudflared started (PID $($cfProc.Id)). Waiting for tunnel URL..." -ForegroundColor Cyan
+
+          # Poll the log until cloudflared prints its *.trycloudflare.com hostname
+          $cfUrl = $null
+          for ($i = 1; $i -le 90; $i++) {
+            if (Test-Path $log) {
+              $m = Select-String -Path $log -Pattern 'https://[a-z0-9\-]+\.trycloudflare\.com' -AllMatches
+              if ($m) {
+                $cfUrl = $m.Matches[0].Value
+                break
               }
-              Start-Sleep -Seconds 2
+            }
+            Start-Sleep -Seconds 1
           }
 
-          if (-not $tunnelUrl) {
-              $tunnelUrl = "https://your-tunnel-url.trycloudflare.com (check GitHub logs)"
+          if (-not $cfUrl) {
+            Write-Host ">>> ERROR: Cloudflare Quick Tunnel did not start in time." -ForegroundColor Red
+            Write-Host "--- cloudflared log tail ---" -ForegroundColor Yellow
+            if (Test-Path $log) { Get-Content $log -Tail 80 }
+            throw "cloudflared failed to register tunnel."
           }
+
+          $cfHost = $cfUrl -replace '^https?://',''
+          Write-Host "CF_URL=$cfUrl"   | Out-File $env:GITHUB_ENV -Append
+          Write-Host "CF_HOST=$cfHost" | Out-File $env:GITHUB_ENV -Append
+
+          # Save PID so the keep-alive can watchdog it
+          $cfProc.Id | Out-File "C:\cloudflared.pid" -NoNewline
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "     >>> WINDOWS RDP SERVER READY <<<" -ForegroundColor Cyan
-          Write-Host "  Tunnel URL   : $tunnelUrl" -ForegroundColor Yellow
-          Write-Host "  RDP Address  : $tunnelUrl" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  Port         : 3389 (TCP)" -ForegroundColor Yellow
+          Write-Host "  >>> RDP SERVER IS READY! (Cloudflare Quick Tunnel)" -ForegroundColor Cyan
+          Write-Host "  Tunnel URL  : $cfUrl" -ForegroundColor Yellow
+          Write-Host "  Username    : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Password    : Cynet@2026" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Connect using Remote Desktop (mstsc.exe)" -ForegroundColor Magenta
-          Write-Host "This tunnel will stay alive for up to 8 hours." -ForegroundColor Cyan
+          Write-Host ""
+          Write-Host ">>> HOW TO CONNECT FROM YOUR PC:" -ForegroundColor Magenta
+          Write-Host ""
+          Write-Host " 1) Download cloudflared for Windows (single ~25 MB exe):" -ForegroundColor White
+          Write-Host "    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          Write-Host "    Put it in a folder on your PATH (e.g. C:\Windows\System32\cloudflared.exe)"
+          Write-Host ""
+          Write-Host " 2) Open PowerShell / cmd and run (leave this window OPEN):" -ForegroundColor White
+          Write-Host "    cloudflared access tcp --hostname $cfHost --url localhost:3389" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host " 3) Open mstsc.exe and connect to:" -ForegroundColor White
+          Write-Host "    localhost:3389" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host " 4) Log in with user = CynetAdmin, password = Cynet@2026" -ForegroundColor White
+          Write-Host ""
+          Write-Host " NOTE: Cloudflare does NOT expose raw RDP directly on the free tier;"
+          Write-Host "       cloudflared on your PC acts as a local TCP proxy into the tunnel."
+          Write-Host "       Close the cloudflared window when you're done."
 
-      - name: 4. Install Python & Java (Optional)
+      - name: 4. Install Python & Java (Adoptium Temurin 21)
         run: |
           $ProgressPreference = 'SilentlyContinue'
           Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
-          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1" -Wait
-          Remove-Item "C:\python-installer.exe" -Force
+          curl.exe -L --retry 3 -o "C:\python-installer.exe" "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe"
+          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
+          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
 
-          Write-Host ">>> Installing Temurin JDK 21 ..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
-          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome' -Wait
-          Remove-Item "C:\jdk.msi" -Force
+          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
+          curl.exe -L --retry 3 -o "C:\jdk.msi" "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse"
+          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
+          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
 
-          Write-Host ">>> Python and Java installed successfully." -ForegroundColor Green
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
+          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
+          if ($pyPath) { Write-Host "  Python    : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
+          else         { Write-Host "  Python    : NOT FOUND on PATH" -ForegroundColor Red }
+          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
+          if ($javaPath) { Write-Host "  Java      : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
+          else           { Write-Host "  Java      : NOT FOUND on PATH" -ForegroundColor Red }
+          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Keep Server Alive (8 Hours)
+      - name: 5. Keep Server Alive (up to 6 h)
         run: |
-          for ($i = 1; $i -le 480; $i++) {
+          Write-Host ">>> Server alive loop starting. Max 6 h (GitHub Actions runner cap)." -ForegroundColor Cyan
+          $log = "C:\cloudflared.log"
+          for ($i = 1; $i -le 355; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/480] Cloudflared RDP Server is running..."
+
+            # Check cloudflared is still running; if not, bail out with logs
+            $pidFile = "C:\cloudflared.pid"
+            if (Test-Path $pidFile) {
+              $cfPid = [int](Get-Content $pidFile)
+              $proc = Get-Process -Id $cfPid -ErrorAction SilentlyContinue
+              if (-not $proc) {
+                Write-Host ">>> [$i/355] !! cloudflared (PID $cfPid) DIED. Last 40 lines of log:" -ForegroundColor Red
+                if (Test-Path $log) { Get-Content $log -Tail 40 }
+                throw "cloudflared process died — tunnel is down."
+              }
+            }
+
+            # Print a heartbeat + small log tail every 10 minutes
+            if ($i % 10 -eq 0) {
+              Write-Host "[$i/355] Server running... ($($i) min uptime)" -ForegroundColor Green
+              if (Test-Path $log) { Get-Content $log -Tail 5 }
+            } else {
+              Write-Host "[$i/355] Server running..."
+            }
           }
