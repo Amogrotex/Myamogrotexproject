@@ -1,117 +1,273 @@
 name: Windows Cloud RDP
 
+# Fast path: RDP+UDP first, Tailscale unattended + direct punch, then tools.
+# Copy this file to .github/workflows/ in your repo.
+#
+# Required secret:  TAILSCALE_AUTHKEY
+#   Use a reusable + ephemeral auth key:
+#   https://login.tailscale.com/admin/settings/keys
+#
+# On your PC after the job prints READY:
+#   mstsc /v:<tailscale-ip>
+#   or double-click the downloaded connect-fast.rdp artifact
+
 on:
   workflow_dispatch:
+    inputs:
+      client_device:
+        description: "Your PC's Tailscale hostname (used to punch a direct path)"
+        required: false
+        default: "desktop-8kf2694"
+      hostname:
+        description: "Name this runner shows up as in Tailscale"
+        required: false
+        default: "github-rdp-server"
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 999
+    timeout-minutes: 360
 
     steps:
-      - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
+      - name: 1. Enable RDP (UDP preferred) + performance
+        shell: pwsh
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
+          $ErrorActionPreference = "Continue"
+
+          # --- Allow RDP ---
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "UserAuthentication" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-          # --- RDP performance tuning (server-side) ---
+          # Tailscale CGNAT range only — tighter + avoids blocking ourselves
+          New-NetFirewallRule -DisplayName "RDP Tailscale TCP" -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -RemoteAddress 100.64.0.0/10 -ErrorAction SilentlyContinue | Out-Null
+          New-NetFirewallRule -DisplayName "RDP Tailscale UDP" -Direction Inbound -Protocol UDP -LocalPort 3389 -Action Allow -RemoteAddress 100.64.0.0/10 -ErrorAction SilentlyContinue | Out-Null
+
+          # --- RDP transport: 2 = prefer UDP (1 = TCP ONLY — that was the old bug) ---
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $tsPol -Force | Out-Null
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
-          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 2 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
+          # Do NOT set ColorDepth here — value 24 is invalid (enum is 1-5) and the client should pick
 
-          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
+          # Cut unused RDP channels (less overhead on a 200ms+ link)
+          Set-ItemProperty -Path $tsPol -Name "fDisableCpm" -Value 1 -Type DWord -Force          # printers
+          Set-ItemProperty -Path $tsPol -Name "fDisableCdm" -Value 1 -Type DWord -Force          # drives
+          Set-ItemProperty -Path $tsPol -Name "fDisableLPT" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "fDisableCcm" -Value 1 -Type DWord -Force          # COM
+          Set-ItemProperty -Path $tsPol -Name "fDisableAudioCapture" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "fDisableCam" -Value 1 -Type DWord -Force          # camera / video capture
+          # clipboard stays enabled
+
+          # Connect UDP immediately instead of spending seconds on network detection
+          $rdpTcp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+          Set-ItemProperty -Path $rdpTcp -Name "SelectTransport" -Value 2 -Type DWord -Force
+          Set-ItemProperty -Path $rdpTcp -Name "fReverseConnectMode" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdpTcp -Name "KeepAliveTimeout" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+
+          # High Performance power plan
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
 
-          Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
+          # Free CPU for RDP on a small runner
+          foreach ($svc in @("SysMain", "WSearch", "DiagTrack", "SysMain")) {
+            Stop-Service $svc -Force -ErrorAction SilentlyContinue
+            Set-Service $svc -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue } catch {}
+
+          # Best-performance visual effects for new logons
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2 -Type DWord -Force
+          $defaultHive = "C:\Users\Default\NTUSER.DAT"
+          if (Test-Path $defaultHive) {
+            reg load HKU\DefUser $defaultHive | Out-Null
+            New-Item -Path "Registry::HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Force | Out-Null
+            Set-ItemProperty -Path "Registry::HKU\DefUser\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" -Name "VisualFXSetting" -Value 2 -Type DWord -Force
+            Set-ItemProperty -Path "Registry::HKU\DefUser\Control Panel\Desktop" -Name "DragFullWindows" -Value "0" -Force -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path "Registry::HKU\DefUser\Control Panel\Desktop\WindowMetrics" -Name "MinAnimate" -Value "0" -Force -ErrorAction SilentlyContinue
+            [gc]::Collect()
+            Start-Sleep -Milliseconds 300
+            reg unload HKU\DefUser | Out-Null
+          }
+
+          # Apply RDP policy without a full reboot
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
+
+          Write-Host ">>> RDP ready (UDP preferred) + High Performance." -ForegroundColor Green
 
       - name: 2. Create Admin Account
+        shell: pwsh
         run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
+          net user CynetAdmin Cynet@2026
 
-      - name: 3a. Cache Tailscale Installer (skip re-download every run)
+      - name: 3a. Cache Tailscale installer
         id: ts-cache
         uses: actions/cache@v4
         with:
           path: C:\tailscale.msi
-          key: tailscale-msi-v1
+          key: tailscale-msi-v2
 
-      - name: 3b. Install & Connect Tailscale (optimized)
+      - name: 3b. Install Tailscale, go online, punch direct path
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          CLIENT_DEVICE: ${{ inputs.client_device }}
+          TS_HOSTNAME: ${{ inputs.hostname }}
+        shell: pwsh
         run: |
-          # Kill PowerShell's progress bar rendering -> 5-10x faster downloads
-          $ProgressPreference = 'SilentlyContinue'
+          $ErrorActionPreference = "Continue"
+          $ProgressPreference = "SilentlyContinue"
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
 
-          # Download only on cache miss (curl.exe is much faster than Invoke-WebRequest)
+          if (-not $Env:TAILSCALE_AUTHKEY) {
+            throw "TAILSCALE_AUTHKEY secret is empty. Create a reusable+ephemeral key at https://login.tailscale.com/admin/settings/keys"
+          }
+
           if (-not (Test-Path "C:\tailscale.msi")) {
             curl.exe -L --retry 3 --retry-delay 2 -o "C:\tailscale.msi" "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           }
-          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
 
-          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          # Unattended = stay connected with no interactive Windows login (required for RDP jump-box)
+          # TS_INSTALLUPDATES=never = don't burn CPU checking for upgrades
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /qn /norestart TS_UNATTENDEDMODE=always TS_INSTALLUPDATES=never TS_NOLAUNCH=1" -Wait
 
-          # --reset clears stale state; skip features we don't use = faster startup
-          # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
-          # NOTE: --netfilter-mode was REMOVED from current Tailscale Windows builds,
-          # so it is intentionally not used here.
-          & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
-                   --reset --ssh=false --accept-dns=false
+          $ready = $false
+          for ($i = 1; $i -le 30; $i++) {
+            if (Test-Path $ts) { try { & $ts version | Out-Null; if ($LASTEXITCODE -eq 0) { $ready = $true; break } } catch {} }
+            Start-Sleep -Seconds 1
+          }
+          if (-not $ready) { throw "tailscale.exe did not become ready after MSI install" }
+
+          # --unattended keeps the data plane up before anyone RDPs in
+          # --accept-dns=false / --accept-routes=false = less setup, no DNS hijack
+          # no --reset: reuse hostname instead of spawning github-rdp-server-1/2/3/4
+          & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="$Env:TS_HOSTNAME" --unattended --ssh=false --accept-dns=false --accept-routes=false
           if ($LASTEXITCODE -ne 0) {
-            Write-Host ">>> tailscale up FAILED (exit code $LASTEXITCODE)." -ForegroundColor Red
-            Write-Host "    Check that TAILSCALE_AUTHKEY secret is set, valid and reusable:" -ForegroundColor Red
-            Write-Host "    https://login.tailscale.com/admin/settings/keys" -ForegroundColor Red
-            throw "Tailscale login failed - job aborted."
+            Write-Host ">>> tailscale up FAILED (exit $LASTEXITCODE). Check TAILSCALE_AUTHKEY." -ForegroundColor Red
+            throw "Tailscale login failed"
           }
 
-          # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
-          # while tailscaled finishes starting up)
+          try { & $ts set --auto-update=false } catch {}
+
+          # Windows often marks the Tailscale NIC as Public and then firewalls RDP on it
+          Get-NetConnectionProfile | Where-Object { $_.InterfaceAlias -like "Tailscale*" } | ForEach-Object {
+            try { Set-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -NetworkCategory Private } catch {}
+          }
+
           $ts_ip = $null
           for ($i = 1; $i -le 40; $i++) {
             $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if ($raw) {
-              $ts_ip = ([string]$raw).Trim()
-              break
-            }
+            if ($raw) { $ts_ip = ([string]$raw).Trim(); break }
             Start-Sleep -Milliseconds 500
           }
-
-          # Fallback 1: read the IP from 'status --json' (works even while the
-          # 'ip' subcommand misbehaves)
           if (-not $ts_ip) {
             try {
               $stSelf = & $ts status --json 2>$null | ConvertFrom-Json
-              if ($stSelf.Self.TailscaleIPs) {
-                $ts_ip = [string]$stSelf.Self.TailscaleIPs[0]
-              }
-            } catch { }
+              if ($stSelf.Self.TailscaleIPs) { $ts_ip = [string]$stSelf.Self.TailscaleIPs[0] }
+            } catch {}
           }
-
-          # Fallback 2: show unfiltered diagnostics instead of failing silently
           if (-not $ts_ip) {
-            Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
+            Write-Host ">>> WARN: Tailscale IPv4 not assigned yet:" -ForegroundColor Yellow
             & $ts status
-            & $ts ip -4
           }
 
-          # Fast relay check via JSON (no slow netcheck probes)
+          # Give the coordination server a moment to publish us, then hole-punch
+          Start-Sleep -Seconds 2
+
+          function Test-DirectPeer([string]$name) {
+            if (-not $name) { return $false }
+            Write-Host ">>> Punching direct path to $name ..." -ForegroundColor Cyan
+            & $ts ping --until-direct --timeout=15s $name
+            return ($LASTEXITCODE -eq 0)
+          }
+
           $direct = $false
+          $pathInfo = "unknown"
+          $client = ($Env:CLIENT_DEVICE | ForEach-Object { $_.Trim() })
+          if ($client) { $direct = Test-DirectPeer $client }
+
+          # Also punch any other currently-online peer (covers renamed PCs)
           try {
             $st = & $ts status --json 2>$null | ConvertFrom-Json
-            $peer = $st.Peer.Values | Select-Object -First 1
-            if ($peer) {
-              $direct = [string]::IsNullOrEmpty([string]$peer.Relay)
-              $derp  = if ($peer.Relay) { $peer.Relay } else { "direct (no relay)" }
+            foreach ($p in $st.Peer.PSObject.Properties.Value) {
+              if (-not $p.Online) { continue }
+              $n = $p.HostName
+              if (-not $n) { continue }
+              if ($client -and ($n -ieq $client)) { continue }
+              Test-DirectPeer $n | Out-Null
             }
-          } catch { }
+          } catch {}
+
+          # Correct direct check: Relay is ALWAYS the home DERP city (not the data path).
+          # CurAddr like 1.2.3.4:12345 = direct. Empty / derp-* = relayed.
+          try {
+            $st = & $ts status --json 2>$null | ConvertFrom-Json
+            $target = $null
+            foreach ($p in $st.Peer.PSObject.Properties.Value) {
+              if ($client -and ($p.HostName -ieq $client)) { $target = $p; break }
+            }
+            if (-not $target) {
+              $target = $st.Peer.PSObject.Properties.Value | Where-Object { $_.Online -and $_.Active } | Select-Object -First 1
+            }
+            if ($target) {
+              $cur = [string]$target.CurAddr
+              if ($cur -match '^\d{1,3}(\.\d{1,3}){3}:\d+$') {
+                $direct = $true
+                $pathInfo = "direct $cur"
+              } elseif ($target.Relay) {
+                $direct = $false
+                $pathInfo = "relay $($target.Relay)  (CurAddr='$cur')"
+              } else {
+                $pathInfo = "no path yet (peer=$($target.HostName))"
+              }
+            } else {
+              $pathInfo = "no online peer found — connect from your PC and the path will upgrade"
+            }
+          } catch {
+            $pathInfo = "could not parse status --json"
+          }
+
+          @"
+          full address:s:$ts_ip
+          username:s:CynetAdmin
+          prompt for credentials:i:1
+          authentication level:i:0
+          enablecredsspsupport:i:0
+          negotiate security layer:i:1
+          autoreconnection enabled:i:1
+          bandwidthautodetect:i:0
+          networkautodetect:i:0
+          connection type:i:6
+          compression:i:1
+          session bpp:i:16
+          bitmapcachepersistenable:i:1
+          bitmapcachesize:i:32000
+          videoplaybackmode:i:1
+          audiomode:i:2
+          audiocapturemode:i:0
+          redirectclipboard:i:1
+          redirectprinters:i:0
+          redirectcomports:i:0
+          redirectsmartcards:i:0
+          redirectdrives:i:0
+          redirectwebauthn:i:0
+          displayconnectionbar:i:1
+          disable wallpaper:i:1
+          disable full window drag:i:1
+          disable menu anims:i:1
+          disable themes:i:1
+          allow font smoothing:i:0
+          allow desktop composition:i:0
+          smart sizing:i:1
+          dynamic resolution:i:1
+          screen mode id:i:2
+          use redirection server name:i:0
+          "@ | Set-Content -Path "$env:RUNNER_TEMP\connect-fast.rdp" -Encoding ASCII
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
@@ -119,53 +275,73 @@ jobs:
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
           Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
-          if (-not $direct) {
-            Write-Host "  WARN: relayed connection will be slow. Tips below." -ForegroundColor Red
-          }
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  Path         : $pathInfo" -ForegroundColor $(if ($direct) { "Green" } else { "Yellow" })
+          Write-Host "  mstsc /v:$ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
-
-          # If relayed, help the user fix it
           if (-not $direct) {
             Write-Host ""
-            Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
-            Write-Host " 1. Install Tailscale on YOUR PC too and log into the same account (tailscale.com/download)"
-            Write-Host " 2. Check 'tailscale status' on your PC - both machines should show 'direct'"
-            Write-Host " 3. Relayed usually means: closed UDP port 41641, CGNAT, or strict corporate firewall"
-            Write-Host " 4. On your PC: tailscale up --netfilter-mode=off  (removes firewall overhead)"
-            Write-Host " 5. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
+            Write-Host "Not direct yet. On YOUR PC run:" -ForegroundColor Yellow
+            Write-Host "  tailscale ping --until-direct --timeout=20s $Env:TS_HOSTNAME"
+            Write-Host "Then reconnect mstsc. Do NOT use --netfilter-mode (Linux only)."
           }
 
-      - name: 4. Install Python & Java (Adoptium Temurin 21)
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
-          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
-          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
+      - name: 3c. Publish connect-fast.rdp
+        uses: actions/upload-artifact@v4
+        with:
+          name: connect-fast
+          path: ${{ runner.temp }}\connect-fast.rdp
+          if-no-files-found: ignore
 
-          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
-          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
-          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
-          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
+      - name: 4. Install Python & Java (system-wide, after RDP is already up)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+          $py = Start-Job -ScriptBlock {
+            $ProgressPreference = "SilentlyContinue"
+            Write-Host ">>> Installing Python 3.12 ..."
+            curl.exe -L --retry 3 -o "C:\python-installer.exe" "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe"
+            Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
+            Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
+          }
+          $jdk = Start-Job -ScriptBlock {
+            $ProgressPreference = "SilentlyContinue"
+            Write-Host ">>> Installing Temurin JDK 21 ..."
+            curl.exe -L --retry 3 -o "C:\jdk.msi" "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse"
+            Start-Process msiexec -ArgumentList "/i C:\jdk.msi /qn ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart" -Wait
+            Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
+          }
+          $py, $jdk | Wait-Job | Receive-Job
+          $py, $jdk | Remove-Job -Force -ErrorAction SilentlyContinue
 
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
-          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
-          if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
-          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
-          if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
-          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
+          $pyCmd = Get-Command python -ErrorAction SilentlyContinue
+          if ($pyCmd) { Write-Host "  Python : $(python --version 2>&1) ($($pyCmd.Source))" -ForegroundColor Yellow } else { Write-Host "  Python : NOT ON PATH yet (open a new RDP session)" -ForegroundColor Yellow }
+          $javaCmd = Get-Command java -ErrorAction SilentlyContinue
+          if ($javaCmd) { Write-Host "  Java   : $(java -version 2>&1 | Select-Object -First 1) ($($javaCmd.Source))" -ForegroundColor Yellow } else { Write-Host "  Java   : NOT ON PATH yet (open a new RDP session)" -ForegroundColor Yellow }
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Keep Server Alive (6 Hours)
+      - name: 5. Keep Server Alive (~6 hours) and re-punch direct
+        env:
+          CLIENT_DEVICE: ${{ inputs.client_device }}
+        shell: pwsh
         run: |
-          for ($i = 1; $i -le 999; $i++) {
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $client = $Env:CLIENT_DEVICE
+          for ($i = 1; $i -le 350; $i++) {
             Start-Sleep -Seconds 60
-            Write-Host "[$i/999] Server running..."
+            Write-Host "[$i/350] Server running..."
+            # Re-punch every 10 min so NAT mappings / DERP don't stick
+            if (($i % 10 -eq 0) -and (Test-Path $ts) -and $client) {
+              & $ts ping --until-direct --timeout=8s $client 2>$null | Out-Null
+            }
           }
+
+      - name: 6. Logout Tailscale (cleanup)
+        if: always()
+        shell: pwsh
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          if (Test-Path $ts) { & $ts logout 2>$null }
