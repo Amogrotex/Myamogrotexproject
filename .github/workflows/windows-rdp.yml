@@ -1,32 +1,4 @@
-# =============================================================================
-#  Windows RDP - Chrome Remote Desktop (FASTEST, no VPN, no tunnel)
-# =============================================================================
-#  Why this one:
-#   - No VPN, no Cloudflare, no ngrok, no tokens. Google's own protocol (VP9)
-#     + global relay network. Usually the fastest option for GitHub Actions.
-#   - Access from ANY browser: https://remotedesktop.google.com/access
-#     (or the Chrome Remote Desktop app on Windows/Android/iOS).
-#   - Nothing to rate-limit or time out like trycloudflare tunnels.
-#
-#  ONE-TIME SETUP PER RUN (2 minutes):
-#   1. Go to https://remotedesktop.google.com/headless in any browser,
-#      sign in with YOUR Google account -> Begin -> Next -> Authorize.
-#   2. On the next page switch to the "Windows" commands and COPY the
-#      code inside --code="..."  (looks like 4/0AfXXXX...)
-#   3. In this repo: Settings -> Secrets and variables -> Actions ->
-#      New repository secret:  name = CRD_CODE,  value = the code.
-#   4. IMMEDIATELY go to Actions -> run this workflow (the code expires
-#      after ~5-10 minutes and is single-use).
-#   5. Open the job log -> step 3 banner confirms "Machine: github-rdp".
-#      Go to https://remotedesktop.google.com/access -> connect to
-#      "github-rdp" with PIN 123456.
-#
-#  NOTE: GitHub's ToS says Actions is for CI/CD only. GitHub has been
-#  disabling Actions on repositories used as free RDP hosts. Use a
-#  private repo and don't expect this to live forever. Max run = 6 hours.
-# =============================================================================
-
-name: Windows RDP (Chrome Remote Desktop - no VPN)
+name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
@@ -34,69 +6,166 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360   # GitHub-hosted maximum (6 hours)
+    timeout-minutes: 999
 
     steps:
-      - name: 1. Install Chrome Remote Desktop host
+      - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
+          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
+
+          # --- RDP performance tuning (server-side) ---
+          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $tsPol -Force | Out-Null
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
+          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
+
+          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
+
+          Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
+
+      - name: 2. Create Admin Account
+        run: |
+          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
+          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Cynet@2026
+
+      - name: 3a. Cache Tailscale Installer (skip re-download every run)
+        id: ts-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\tailscale.msi
+          key: tailscale-msi-v1
+
+      - name: 3b. Install & Connect Tailscale (optimized)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          # Kill PowerShell's progress bar rendering -> 5-10x faster downloads
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Download only on cache miss (curl.exe is much faster than Invoke-WebRequest)
+          if (-not (Test-Path "C:\tailscale.msi")) {
+            curl.exe -L --retry 3 --retry-delay 2 -o "C:\tailscale.msi" "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          }
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
+
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+          # --reset clears stale state; skip features we don't use = faster startup
+          # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
+          # NOTE: --netfilter-mode was REMOVED from current Tailscale Windows builds,
+          # so it is intentionally not used here.
+          & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
+                   --reset --ssh=false --accept-dns=false
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host ">>> tailscale up FAILED (exit code $LASTEXITCODE)." -ForegroundColor Red
+            Write-Host "    Check that TAILSCALE_AUTHKEY secret is set, valid and reusable:" -ForegroundColor Red
+            Write-Host "    https://login.tailscale.com/admin/settings/keys" -ForegroundColor Red
+            throw "Tailscale login failed - job aborted."
+          }
+
+          # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
+          # while tailscaled finishes starting up)
+          $ts_ip = $null
+          for ($i = 1; $i -le 40; $i++) {
+            $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if ($raw) {
+              $ts_ip = ([string]$raw).Trim()
+              break
+            }
+            Start-Sleep -Milliseconds 500
+          }
+
+          # Fallback 1: read the IP from 'status --json' (works even while the
+          # 'ip' subcommand misbehaves)
+          if (-not $ts_ip) {
+            try {
+              $stSelf = & $ts status --json 2>$null | ConvertFrom-Json
+              if ($stSelf.Self.TailscaleIPs) {
+                $ts_ip = [string]$stSelf.Self.TailscaleIPs[0]
+              }
+            } catch { }
+          }
+
+          # Fallback 2: show unfiltered diagnostics instead of failing silently
+          if (-not $ts_ip) {
+            Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
+            & $ts status
+            & $ts ip -4
+          }
+
+          # Fast relay check via JSON (no slow netcheck probes)
+          $direct = $false
+          try {
+            $st = & $ts status --json 2>$null | ConvertFrom-Json
+            $peer = $st.Peer.Values | Select-Object -First 1
+            if ($peer) {
+              $direct = [string]::IsNullOrEmpty([string]$peer.Relay)
+              $derp  = if ($peer.Relay) { $peer.Relay } else { "direct (no relay)" }
+            }
+          } catch { }
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
+          if (-not $direct) {
+            Write-Host "  WARN: relayed connection will be slow. Tips below." -ForegroundColor Red
+          }
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
+
+          # If relayed, help the user fix it
+          if (-not $direct) {
+            Write-Host ""
+            Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
+            Write-Host " 1. Install Tailscale on YOUR PC too and log into the same account (tailscale.com/download)"
+            Write-Host " 2. Check 'tailscale status' on your PC - both machines should show 'direct'"
+            Write-Host " 3. Relayed usually means: closed UDP port 41641, CGNAT, or strict corporate firewall"
+            Write-Host " 4. On your PC: tailscale up --netfilter-mode=off  (removes firewall overhead)"
+            Write-Host " 5. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
+          }
+
+      - name: 4. Install Python & Java (Adoptium Temurin 21)
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          $msi = "C:\crd-host.msi"
-          if (-not (Test-Path $msi)) {
-            curl.exe -sL --retry 3 -o $msi "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
-          }
-          Start-Process msiexec -ArgumentList "/i $msi /qn /norestart" -Wait
-          Write-Host ">>> Chrome Remote Desktop host installed." -ForegroundColor Green
+          Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
+          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
+          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
 
-      - name: 2. Register this machine with your Google account
-        env:
-          CRD_CODE: ${{ secrets.CRD_CODE }}
-        run: |
-          if (-not $env:CRD_CODE -or $env:CRD_CODE -notlike "4/*") {
-            throw "Secret CRD_CODE is missing or invalid. Get it at https://remotedesktop.google.com/headless (see comments at top of this file), save it as repo secret CRD_CODE, then re-run."
-          }
+          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
+          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
+          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
 
-          $hostExe = "$env:ProgramFiles(x86)\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
-          if (-not (Test-Path $hostExe)) { throw "remoting_start_host.exe not found - step 1 failed?" }
-
-          # --pin is an undocumented but working flag (min 6 digits)
-          & $hostExe --code="$env:CRD_CODE" `
-                     --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
-                     --name="github-rdp" --pin=123456
-          Start-Sleep -Seconds 10
-
-          $svc = Get-Service chromoting -ErrorAction SilentlyContinue
-          if (-not $svc -or $svc.Status -ne 'Running') {
-            Write-Host ">>> Warning: chromoting service not running yet. State: $($svc.Status)" -ForegroundColor Yellow
-            Start-Service chromoting -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 5
-            $svc = Get-Service chromoting -ErrorAction SilentlyContinue
-          }
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
           Write-Host ""
-          Write-Host "==============================================================" -ForegroundColor Green
-          Write-Host "   >>> CHROME REMOTE DESKTOP IS READY <<<" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "   Open in ANY browser:  https://remotedesktop.google.com/access" -ForegroundColor Yellow
-          Write-Host "   Machine name : github-rdp" -ForegroundColor Yellow
-          Write-Host "   PIN           : 123456" -ForegroundColor Yellow
-          Write-Host "   Service state : $($svc.Status)" -ForegroundColor $(if ($svc.Status -eq 'Running') { "Green" } else { "Red" })
-          Write-Host "==============================================================" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
+          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
+          if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
+          else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
+          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
+          if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
+          else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
+          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 3. Keep server alive (up to ~6h) + watchdog
+      - name: 5. Keep Server Alive (6 Hours)
         run: |
-          Write-Host ">>> Keeping the runner alive. Do NOT cancel this job while you are connected."
-          Write-Host ">>> GitHub kills the machine 6 hours after start - the session dies with it."
-          $started = (Get-Date).ToUniversalTime().ToString("HH:mm 'UTC'")
-          Write-Host ">>> Run started at $started"
-          for ($i = 1; $i -le 348; $i++) {
-            $svc = Get-Service chromoting -ErrorAction SilentlyContinue
-            if (-not $svc) {
-              Write-Host "[$i/348] chromoting service MISSING - trying to re-register? Check step 2 logs." -ForegroundColor Red
-            } elseif ($svc.Status -ne 'Running') {
-              Write-Host "[$i/348] chromoting stopped - restarting ..." -ForegroundColor Yellow
-              Start-Service chromoting -ErrorAction SilentlyContinue
-            } else {
-              Write-Host "[$i/348] chromoting RUNNING - you can connect at remotedesktop.google.com/access"
-            }
+          for ($i = 1; $i -le 999; $i++) {
             Start-Sleep -Seconds 60
+            Write-Host "[$i/999] Server running..."
           }
-          Write-Host ">>> Time's up - job ending, machine is gone. Re-run for a new session." -ForegroundColor Yellow
