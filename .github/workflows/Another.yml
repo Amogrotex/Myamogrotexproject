@@ -1,0 +1,104 @@
+name: Windows Cloud RDP (Cloudflared)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 480   # 8 hours max
+
+    steps:
+      - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
+
+          # RDP Performance Tuning
+          $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $tsPol -Force | Out-Null
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
+
+          # High Performance power plan
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
+
+          Write-Host ">>> RDP enabled with performance tuning." -ForegroundColor Green
+
+      - name: 2. Create Admin Account
+        run: |
+          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
+          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Cynet@2026
+
+          Write-Host ">>> Admin account 'CynetAdmin' created." -ForegroundColor Green
+
+      - name: 3. Install & Run Cloudflared Tunnel
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          Write-Host ">>> Downloading cloudflared..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe" -OutFile "C:\cloudflared.exe"
+
+          Write-Host ">>> Starting Cloudflare Tunnel for RDP (Port 3389)..." -ForegroundColor Cyan
+          
+          # Run cloudflared in background
+          Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList "tunnel --no-autoupdate --url tcp://localhost:3389 --token $Env:CLOUDFLARE_TUNNEL_TOKEN" -NoNewWindow
+
+          Start-Sleep -Seconds 8
+
+          # Get the tunnel URL
+          $tunnelUrl = $null
+          for ($i = 1; $i -le 15; $i++) {
+              $log = Get-Content "$env:USERPROFILE\.cloudflared\cloudflared.log" -ErrorAction SilentlyContinue -Raw
+              if ($log -match "https?://([\w-]+)\.trycloudflare\.com") {
+                  $tunnelUrl = $matches[0]
+                  break
+              }
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $tunnelUrl) {
+              $tunnelUrl = "https://your-tunnel-url.trycloudflare.com (check GitHub logs)"
+          }
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "     >>> WINDOWS RDP SERVER READY <<<" -ForegroundColor Cyan
+          Write-Host "  Tunnel URL   : $tunnelUrl" -ForegroundColor Yellow
+          Write-Host "  RDP Address  : $tunnelUrl" -ForegroundColor Yellow
+          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "  Port         : 3389 (TCP)" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Connect using Remote Desktop (mstsc.exe)" -ForegroundColor Magenta
+          Write-Host "This tunnel will stay alive for up to 8 hours." -ForegroundColor Cyan
+
+      - name: 4. Install Python & Java (Optional)
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
+          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1" -Wait
+          Remove-Item "C:\python-installer.exe" -Force
+
+          Write-Host ">>> Installing Temurin JDK 21 ..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
+          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome' -Wait
+          Remove-Item "C:\jdk.msi" -Force
+
+          Write-Host ">>> Python and Java installed successfully." -ForegroundColor Green
+
+      - name: 5. Keep Server Alive (8 Hours)
+        run: |
+          for ($i = 1; $i -le 480; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/480] Cloudflared RDP Server is running..."
+          }
