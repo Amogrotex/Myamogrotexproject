@@ -1,31 +1,32 @@
 # =============================================================================
-#  Windows Cloud RDP - browser access via Cloudflare quick tunnel + MeshCentral
+#  Windows RDP - Chrome Remote Desktop (FASTEST, no VPN, no tunnel)
 # =============================================================================
-#  FIXES vs. the old workflow:
-#   1. timeout-minutes: 999 -> 360. GitHub-hosted runners hard-cap at 360
-#      minutes (6h). A value above 360 makes the workflow file INVALID, which
-#      is why the run never started.
-#   2. Tailscale removed entirely -> replaced with Cloudflare quick tunnel
-#      (no account, no token, no secrets needed).
-#   3. `net user runneradmin ...` removed - changing the runneradmin password
-#      mid-run breaks the GitHub runner itself.
-#   4. Python 3.12 and JDK 21 are ALREADY preinstalled on windows-latest, so
-#      the big installer downloads are gone (kept a verify step only).
-#   5. Added MeshCentral: a web-based RDP gateway so you can use the Windows
-#      desktop FROM A BROWSER (no mstsc, no extra client).
-#   6. Added a WATCHDOG in step 8: if cloudflared dies or Cloudflare returns
-#      Error 1033 (dead edge), the tunnel + MeshCentral restart automatically
-#      and the new URL is printed in the log.
+#  Why this one:
+#   - No VPN, no Cloudflare, no ngrok, no tokens. Google's own protocol (VP9)
+#     + global relay network. Usually the fastest option for GitHub Actions.
+#   - Access from ANY browser: https://remotedesktop.google.com/access
+#     (or the Chrome Remote Desktop app on Windows/Android/iOS).
+#   - Nothing to rate-limit or time out like trycloudflare tunnels.
 #
-#  IMPORTANT: the URL is UNIQUE PER RUN and dies when the job ends (max 6h).
-#  GitHub's ToS says Actions is for CI/CD only. GitHub has been disabling
-#  Actions on repositories used as free RDP hosts. Use a private repo and
-#  don't expect this to live forever. The URL below is PUBLIC while the job
-#  runs - anyone with the link can see the login page, and the password is
-#  printed in the job log. Change "Cynet@2026" in this file.
+#  ONE-TIME SETUP PER RUN (2 minutes):
+#   1. Go to https://remotedesktop.google.com/headless in any browser,
+#      sign in with YOUR Google account -> Begin -> Next -> Authorize.
+#   2. On the next page switch to the "Windows" commands and COPY the
+#      code inside --code="..."  (looks like 4/0AfXXXX...)
+#   3. In this repo: Settings -> Secrets and variables -> Actions ->
+#      New repository secret:  name = CRD_CODE,  value = the code.
+#   4. IMMEDIATELY go to Actions -> run this workflow (the code expires
+#      after ~5-10 minutes and is single-use).
+#   5. Open the job log -> step 3 banner confirms "Machine: github-rdp".
+#      Go to https://remotedesktop.google.com/access -> connect to
+#      "github-rdp" with PIN 123456.
+#
+#  NOTE: GitHub's ToS says Actions is for CI/CD only. GitHub has been
+#  disabling Actions on repositories used as free RDP hosts. Use a
+#  private repo and don't expect this to live forever. Max run = 6 hours.
 # =============================================================================
 
-name: Windows Cloud RDP (Cloudflare + browser)
+name: Windows RDP (Chrome Remote Desktop - no VPN)
 
 on:
   workflow_dispatch:
@@ -36,437 +37,66 @@ jobs:
     timeout-minutes: 360   # GitHub-hosted maximum (6 hours)
 
     steps:
-      - name: 1. Enable RDP + create admin user
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # NLA off: the browser RDP client (MeshCentral) does not support NLA/CredSSP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
-
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
-          Write-Host ">>> RDP enabled. Local user: CynetAdmin" -ForegroundColor Green
-
-      - name: 2. Cache tools (cloudflared + node_modules)
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\cloudflared.exe
-            C:\mesh\node_modules
-          key: cloud-rdp-tools-v1
-
-      - name: 3. Download cloudflared + start quick tunnels
+      - name: 1. Install Chrome Remote Desktop host
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          if (-not (Test-Path "C:\cloudflared.exe")) {
-            curl.exe -sL --retry 3 -o "C:\cloudflared.exe" `
-              "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $msi = "C:\crd-host.msi"
+          if (-not (Test-Path $msi)) {
+            curl.exe -sL --retry 3 -o $msi "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi"
           }
+          Start-Process msiexec -ArgumentList "/i $msi /qn /norestart" -Wait
+          Write-Host ">>> Chrome Remote Desktop host installed." -ForegroundColor Green
 
-          function Start-QuickTunnel([string]$target, [string]$outLog, [string]$errLog) {
-            Start-Process -FilePath "C:\cloudflared.exe" `
-              -ArgumentList @("tunnel", "--url", $target, "--no-autoupdate") `
-              -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
-              -WindowStyle Hidden | Out-Null
-            for ($i = 1; $i -le 30; $i++) {
-              $m = Select-String -Path $outLog, $errLog -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($m) { return $m.Matches[0].Value }
-              Start-Sleep -Seconds 1
-            }
-            return $null
-          }
-
-          # Tunnel 1: browser RDP via MeshCentral (will listen on port 8080)
-          $webUrl = $null
-          for ($attempt = 1; $attempt -le 5 -and -not $webUrl; $attempt++) {
-            Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            $webUrl = Start-QuickTunnel "http://localhost:8080" "C:\cf-web-out.log" "C:\cf-web-err.log"
-            if (-not $webUrl) { Write-Host ">>> Tunnel attempt $attempt failed, retrying..." -ForegroundColor Yellow }
-          }
-          if (-not $webUrl) {
-            Get-Content "C:\cf-web-out.log", "C:\cf-web-err.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
-            throw "Cloudflare quick tunnel failed to start (rate limited?). Try re-running the workflow."
-          }
-
-          # Tunnel 2: native RDP fallback (for mstsc on your own PC)
-          $rdpUrl = Start-QuickTunnel "rdp://localhost:3389" "C:\cf-rdp-out.log" "C:\cf-rdp-err.log"
-          if (-not $rdpUrl) { $rdpUrl = "unavailable (re-run to try again)" }
-
-          "CF_URL=$webUrl"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CF_RDP_URL=$rdpUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host ">>> Browser URL  : $webUrl" -ForegroundColor Cyan
-          Write-Host ">>> RDP fallback : $rdpUrl" -ForegroundColor Cyan
-
-      - name: 4. Install MeshCentral (browser RDP gateway)
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          if (-not (Test-Path "C:\mesh\node_modules\meshcentral\meshcentral.js")) {
-            New-Item -ItemType Directory -Path "C:\mesh" -Force | Out-Null
-            Set-Location C:\mesh
-            npm install meshcentral --no-audit --no-fund --loglevel=error
-          }
-          Write-Host ">>> MeshCentral installed." -ForegroundColor Green
-
-      - name: 5. Configure MeshCentral + create web login
+      - name: 2. Register this machine with your Google account
         env:
-          CF_URL: ${{ env.CF_URL }}
+          CRD_CODE: ${{ secrets.CRD_CODE }}
         run: |
-          $hostName = ($env:CF_URL -replace '^https://', '').Trim()
-          $sessionKey = -join ((48..57) + (97..102) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
-
-          $config = @{
-            settings = @{
-              port          = 8080
-              aliasPort     = 0
-              redirPort     = 0
-              mpsPort       = 0
-              mpsAliasPort  = 0
-              agentPort     = 0
-              agentAliasPort = 0
-              lanonly       = $true          # LAN mode: no internet certs, no updates
-              tlsOffload    = "0.0.0.0/0"    # Cloudflare terminates TLS, MeshCentral serves HTTP
-              sessionKey    = $sessionKey
-              noAgentUpdate = $true
-            }
-            domains = @{
-              $hostName = @{
-                title       = "Windows RDP"
-                title2      = "MeshCentral"
-                newAccounts = $false
-              }
-            }
+          if (-not $env:CRD_CODE -or $env:CRD_CODE -notlike "4/*") {
+            throw "Secret CRD_CODE is missing or invalid. Get it at https://remotedesktop.google.com/headless (see comments at top of this file), save it as repo secret CRD_CODE, then re-run."
           }
-          New-Item -ItemType Directory -Path "C:\mesh\meshcentral-data" -Force | Out-Null
-          $config | ConvertTo-Json -Depth 10 | Set-Content -Path "C:\mesh\meshcentral-data\config.json" -Encoding utf8
 
-          # Create the login account BEFORE starting the server (server must be offline)
-          Set-Location C:\mesh
-          node "C:\mesh\node_modules\meshcentral\meshcentral.js" --createaccount Cynet --pass "Cynet@2026"
-          node "C:\mesh\node_modules\meshcentral\meshcentral.js" --adminaccount Cynet
-          Write-Host ">>> MeshCentral configured. Web login: Cynet / Cynet@2026" -ForegroundColor Green
+          $hostExe = "$env:ProgramFiles(x86)\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $hostExe)) { throw "remoting_start_host.exe not found - step 1 failed?" }
 
-      - name: 6. Start MeshCentral + health check
-        run: |
-          Start-Process -FilePath "node.exe" `
-            -ArgumentList "C:\mesh\node_modules\meshcentral\meshcentral.js" `
-            -WorkingDirectory "C:\mesh" `
-            -RedirectStandardOutput "C:\mesh\mesh.log" -RedirectStandardError "C:\mesh\mesh-err.log" `
-            -WindowStyle Hidden | Out-Null
+          # --pin is an undocumented but working flag (min 6 digits)
+          & $hostExe --code="$env:CRD_CODE" `
+                     --redirect-url="https://remotedesktop.google.com/_/oauthredirect" `
+                     --name="github-rdp" --pin=123456
+          Start-Sleep -Seconds 10
 
-          $ok = $false
-          for ($i = 1; $i -le 90; $i++) {
-            try {
-              $r = Invoke-WebRequest "http://localhost:8080" -UseBasicParsing -TimeoutSec 5
-              if ($r.StatusCode -lt 500) { $ok = $true; break }
-            } catch { }
-            Start-Sleep -Seconds 2
+          $svc = Get-Service chromoting -ErrorAction SilentlyContinue
+          if (-not $svc -or $svc.Status -ne 'Running') {
+            Write-Host ">>> Warning: chromoting service not running yet. State: $($svc.Status)" -ForegroundColor Yellow
+            Start-Service chromoting -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            $svc = Get-Service chromoting -ErrorAction SilentlyContinue
           }
-          if (-not $ok) {
-            Get-Content "C:\mesh\mesh.log", "C:\mesh\mesh-err.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
-            throw "MeshCentral did not start - see log above."
-          }
-          Write-Host ">>> MeshCentral is UP on http://localhost:8080" -ForegroundColor Green
-
-      - name: 7. Toolchain check (Python & Java are preinstalled)
-        run: |
-          Write-Host ">>> windows-latest already ships Python 3.12 and JDK 21 - no install needed:"
-          python --version 2>&1
-          $j = if (Get-Command java -ErrorAction SilentlyContinue) { "java" }
-               elseif (Test-Path "$env:JAVA_HOME_21_X64\bin\java.exe") { "$env:JAVA_HOME_21_X64\bin\java.exe" }
-               else { $null }
-          if ($j) { & $j -version 2>&1 | Select-Object -First 1 }
-          else { Write-Host "Java not found on PATH" -ForegroundColor Red }
-
-      - name: 8. Keep alive (up to ~6h) + auto-repair tunnels
-        env:
-          CF_URL: ${{ env.CF_URL }}
-          CF_RDP_URL: ${{ env.CF_RDP_URL }}
-        run: |
-          $started = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm 'UTC'")
-          $script:webUrl = $env:CF_URL
-          $script:rdpUrl = $env:CF_RDP_URL
-
           Write-Host ""
           Write-Host "==============================================================" -ForegroundColor Green
-          Write-Host "   >>> OPEN THIS URL IN YOUR BROWSER (any device) <<<" -ForegroundColor Cyan
-          Write-Host "       $script:webUrl"
+          Write-Host "   >>> CHROME REMOTE DESKTOP IS READY <<<" -ForegroundColor Cyan
           Write-Host ""
-          Write-Host "   Web login : Cynet" -ForegroundColor Yellow
-          Write-Host "   Password  : Cynet@2026" -ForegroundColor Yellow
-          Write-Host ""
-          Write-Host "   In the browser, once logged in:"
-          Write-Host "     1. My Devices -> Add Device Group -> type 'Local Devices (No Agent)'"
-          Write-Host "     2. Add Device -> type Windows -> address 127.0.0.1"
-          Write-Host "     3. Open the device -> RDP tab -> host 127.0.0.1"
-          Write-Host "        user CynetAdmin / password Cynet@2026 -> Connect"
-          Write-Host ""
-          Write-Host "   Run started : $started" -ForegroundColor Yellow
-          Write-Host "   GitHub KILLS this job 6 hours after start. The URL dies with it." -ForegroundColor Yellow
-          Write-Host "   This URL is UNIQUE to this run - never reuse an old run's URL." -ForegroundColor Yellow
-          Write-Host "   If Cloudflare shows Error 1033, the watchdog below restarts the" -ForegroundColor Yellow
-          Write-Host "   tunnel automatically (the URL will change - watch this log)." -ForegroundColor Yellow
+          Write-Host "   Open in ANY browser:  https://remotedesktop.google.com/access" -ForegroundColor Yellow
+          Write-Host "   Machine name : github-rdp" -ForegroundColor Yellow
+          Write-Host "   PIN           : 123456" -ForegroundColor Yellow
+          Write-Host "   Service state : $($svc.Status)" -ForegroundColor $(if ($svc.Status -eq 'Running') { "Green" } else { "Red" })
           Write-Host "==============================================================" -ForegroundColor Green
 
-          function Start-QuickTunnel([string]$target, [string]$outLog, [string]$errLog) {
-            Start-Process -FilePath "C:\cloudflared.exe" `
-              -ArgumentList @("tunnel", "--url", $target, "--no-autoupdate") `
-              -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
-              -WindowStyle Hidden | Out-Null
-            for ($i = 1; $i -le 30; $i++) {
-              $m = Select-String -Path $outLog, $errLog -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($m) { return $m.Matches[0].Value }
-              Start-Sleep -Seconds 1
-            }
-            return $null
-          }
-
-          function Restart-Tunnels {
-            Write-Host ">>> Tunnel failure detected - restarting cloudflared + MeshCentral ..." -ForegroundColor Yellow
-            Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 3
-
-            # 1) New web tunnel (3 attempts - Cloudflare rate-limits sometimes)
-            $newUrl = $null
-            foreach ($a in 1..3) {
-              Remove-Item "C:\cf-web-out.log","C:\cf-web-err.log" -Force -ErrorAction SilentlyContinue
-              $newUrl = Start-QuickTunnel "http://localhost:8080" "C:\cf-web-out.log" "C:\cf-web-err.log"
-              if ($newUrl) { break }
-              Start-Sleep -Seconds 10
-            }
-            if (-not $newUrl) {
-              Write-Host ">>> Could not create a new tunnel (Cloudflare rate limit?). Will retry next cycle." -ForegroundColor Red
-              return
-            }
-
-            # 2) Point MeshCentral at the NEW hostname (keep everything else)
-            $newHost = ($newUrl -replace '^https://', '').Trim()
-            try {
-              $cfg = Get-Content "C:\mesh\meshcentral-data\config.json" -Raw | ConvertFrom-Json
-              $domainVal = $cfg.domains.PSObject.Properties.Value | Select-Object -First 1
-              $newCfg = [ordered]@{ settings = $cfg.settings; domains = @{ $newHost = $domainVal } }
-              $newCfg | ConvertTo-Json -Depth 10 | Set-Content "C:\mesh\meshcentral-data\config.json" -Encoding utf8
-            } catch { Write-Host ">>> config update failed: $_" -ForegroundColor Red }
-
-            # 3) Restart MeshCentral and wait until it answers
-            Get-Process node -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            Start-Process -FilePath "node.exe" `
-              -ArgumentList "C:\mesh\node_modules\meshcentral\meshcentral.js" `
-              -WorkingDirectory "C:\mesh" `
-              -RedirectStandardOutput "C:\mesh\mesh.log" -RedirectStandardError "C:\mesh\mesh-err.log" `
-              -WindowStyle Hidden | Out-Null
-            for ($j = 1; $j -le 60; $j++) {
-              try { $r = Invoke-WebRequest "http://localhost:8080" -UseBasicParsing -TimeoutSec 3; if ($r.StatusCode -lt 500) { break } } catch { }
-              Start-Sleep -Seconds 2
-            }
-
-            # 4) Restart the native-RDP fallback tunnel too
-            Remove-Item "C:\cf-rdp-out.log","C:\cf-rdp-err.log" -Force -ErrorAction SilentlyContinue
-            $newRdp = Start-QuickTunnel "rdp://localhost:3389" "C:\cf-rdp-out.log" "C:\cf-rdp-err.log"
-            $script:rdpUrl = if ($newRdp) { $newRdp } else { "unavailable" }
-
-            $script:webUrl = $newUrl
-            Write-Host ">>> NEW URL: $newUrl" -ForegroundColor Cyan
-            if ($newRdp) { Write-Host ">>> NEW RDP fallback: $newRdp" -ForegroundColor Cyan }
-          }
-
-          $fails = 0
+      - name: 3. Keep server alive (up to ~6h) + watchdog
+        run: |
+          Write-Host ">>> Keeping the runner alive. Do NOT cancel this job while you are connected."
+          Write-Host ">>> GitHub kills the machine 6 hours after start - the session dies with it."
+          $started = (Get-Date).ToUniversalTime().ToString("HH:mm 'UTC'")
+          Write-Host ">>> Run started at $started"
           for ($i = 1; $i -le 348; $i++) {
-            $cfAlive = [bool](Get-Process cloudflared -ErrorAction SilentlyContinue)
-            $edgeOk = $false
-            try {
-              $r = Invoke-WebRequest $script:webUrl -UseBasicParsing -TimeoutSec 15
-              if ($r.StatusCode -eq 200) { $edgeOk = $true }
-            } catch { }
-
-            if (-not $cfAlive -or -not $edgeOk) {
-              $fails++
-              Write-Host "[$i/348] cloudflared:$cfAlive edge:$edgeOk (failure $fails/3)" -ForegroundColor Yellow
-              if (-not $cfAlive -or $fails -ge 3) {
-                Restart-Tunnels
-                $fails = 0
-              }
+            $svc = Get-Service chromoting -ErrorAction SilentlyContinue
+            if (-not $svc) {
+              Write-Host "[$i/348] chromoting service MISSING - trying to re-register? Check step 2 logs." -ForegroundColor Red
+            } elseif ($svc.Status -ne 'Running') {
+              Write-Host "[$i/348] chromoting stopped - restarting ..." -ForegroundColor Yellow
+              Start-Service chromoting -ErrorAction SilentlyContinue
             } else {
-              $fails = 0
-              Write-Host "[$i/348] URL OK | cloudflared OK | meshcentral OK"
+              Write-Host "[$i/348] chromoting RUNNING - you can connect at remotedesktop.google.com/access"
             }
             Start-Sleep -Seconds 60
           }
-          Write-Host ">>> Keep-alive loop finished - job ends now, the URL is gone. Re-run for a new one." -ForegroundColor Yellow
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # NLA off: the browser RDP client (MeshCentral) does not support NLA/CredSSP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0
-
-          $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
-          Write-Host ">>> RDP enabled. Local user: CynetAdmin" -ForegroundColor Green
-
-      - name: 2. Cache tools (cloudflared + node_modules)
-        uses: actions/cache@v4
-        with:
-          path: |
-            C:\cloudflared.exe
-            C:\mesh\node_modules
-          key: cloud-rdp-tools-v1
-
-      - name: 3. Download cloudflared + start quick tunnels
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          if (-not (Test-Path "C:\cloudflared.exe")) {
-            curl.exe -sL --retry 3 -o "C:\cloudflared.exe" `
-              "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          }
-
-          function Start-QuickTunnel([string]$target, [string]$outLog, [string]$errLog) {
-            Start-Process -FilePath "C:\cloudflared.exe" `
-              -ArgumentList @("tunnel", "--url", $target, "--no-autoupdate") `
-              -RedirectStandardOutput $outLog -RedirectStandardError $errLog `
-              -WindowStyle Hidden | Out-Null
-            for ($i = 1; $i -le 30; $i++) {
-              $m = Select-String -Path $outLog, $errLog -Pattern 'https://[a-z0-9-]+\.trycloudflare\.com' -ErrorAction SilentlyContinue | Select-Object -First 1
-              if ($m) { return $m.Matches[0].Value }
-              Start-Sleep -Seconds 1
-            }
-            return $null
-          }
-
-          # Tunnel 1: browser RDP via MeshCentral (will listen on port 8080)
-          $webUrl = $null
-          for ($attempt = 1; $attempt -le 5 -and -not $webUrl; $attempt++) {
-            Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            $webUrl = Start-QuickTunnel "http://localhost:8080" "C:\cf-web-out.log" "C:\cf-web-err.log"
-            if (-not $webUrl) { Write-Host ">>> Tunnel attempt $attempt failed, retrying..." -ForegroundColor Yellow }
-          }
-          if (-not $webUrl) {
-            Get-Content "C:\cf-web-out.log", "C:\cf-web-err.log" -ErrorAction SilentlyContinue | Select-Object -Last 20
-            throw "Cloudflare quick tunnel failed to start (rate limited?). Try re-running the workflow."
-          }
-
-          # Tunnel 2: native RDP fallback (for mstsc on your own PC)
-          $rdpUrl = Start-QuickTunnel "rdp://localhost:3389" "C:\cf-rdp-out.log" "C:\cf-rdp-err.log"
-          if (-not $rdpUrl) { $rdpUrl = "unavailable (re-run to try again)" }
-
-          "CF_URL=$webUrl"     | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "CF_RDP_URL=$rdpUrl" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host ">>> Browser URL  : $webUrl" -ForegroundColor Cyan
-          Write-Host ">>> RDP fallback : $rdpUrl" -ForegroundColor Cyan
-
-      - name: 4. Install MeshCentral (browser RDP gateway)
-        run: |
-          $ProgressPreference = 'SilentlyContinue'
-          if (-not (Test-Path "C:\mesh\node_modules\meshcentral\meshcentral.js")) {
-            New-Item -ItemType Directory -Path "C:\mesh" -Force | Out-Null
-            Set-Location C:\mesh
-            npm install meshcentral --no-audit --no-fund --loglevel=error
-          }
-          Write-Host ">>> MeshCentral installed." -ForegroundColor Green
-
-      - name: 5. Configure MeshCentral + create web login
-        env:
-          CF_URL: ${{ env.CF_URL }}
-        run: |
-          $hostName = ($env:CF_URL -replace '^https://', '').Trim()
-          $sessionKey = -join ((48..57) + (97..102) | Get-Random -Count 32 | ForEach-Object { [char]$_ })
-
-          $config = @{
-            settings = @{
-              port          = 8080
-              aliasPort     = 0
-              redirPort     = 0
-              mpsPort       = 0
-              mpsAliasPort  = 0
-              agentPort     = 0
-              agentAliasPort = 0
-              lanonly       = $true          # LAN mode: no internet certs, no updates
-              tlsOffload    = "0.0.0.0/0"    # Cloudflare terminates TLS, MeshCentral serves HTTP
-              sessionKey    = $sessionKey
-              noAgentUpdate = $true
-            }
-            domains = @{
-              $hostName = @{
-                title       = "Windows RDP"
-                title2      = "MeshCentral"
-                newAccounts = $false
-              }
-            }
-          }
-          New-Item -ItemType Directory -Path "C:\mesh\meshcentral-data" -Force | Out-Null
-          $config | ConvertTo-Json -Depth 10 | Set-Content -Path "C:\mesh\meshcentral-data\config.json" -Encoding utf8
-
-          # Create the login account BEFORE starting the server (server must be offline)
-          Set-Location C:\mesh
-          node "C:\mesh\node_modules\meshcentral\meshcentral.js" --createaccount Cynet --pass "Cynet@2026"
-          node "C:\mesh\node_modules\meshcentral\meshcentral.js" --adminaccount Cynet
-          Write-Host ">>> MeshCentral configured. Web login: Cynet / Cynet@2026" -ForegroundColor Green
-
-      - name: 6. Start MeshCentral + health check
-        run: |
-          Start-Process -FilePath "node.exe" `
-            -ArgumentList "C:\mesh\node_modules\meshcentral\meshcentral.js" `
-            -WorkingDirectory "C:\mesh" `
-            -RedirectStandardOutput "C:\mesh\mesh.log" -RedirectStandardError "C:\mesh\mesh-err.log" `
-            -WindowStyle Hidden | Out-Null
-
-          $ok = $false
-          for ($i = 1; $i -le 90; $i++) {
-            try {
-              $r = Invoke-WebRequest "http://localhost:8080" -UseBasicParsing -TimeoutSec 5
-              if ($r.StatusCode -lt 500) { $ok = $true; break }
-            } catch { }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $ok) {
-            Get-Content "C:\mesh\mesh.log", "C:\mesh\mesh-err.log" -ErrorAction SilentlyContinue | Select-Object -Last 40
-            throw "MeshCentral did not start - see log above."
-          }
-          Write-Host ">>> MeshCentral is UP on http://localhost:8080" -ForegroundColor Green
-
-      - name: 7. Toolchain check (Python & Java are preinstalled)
-        run: |
-          Write-Host ">>> windows-latest already ships Python 3.12 and JDK 21 - no install needed:"
-          python --version 2>&1
-          $j = if (Get-Command java -ErrorAction SilentlyContinue) { "java" }
-               elseif (Test-Path "$env:JAVA_HOME_21_X64\bin\java.exe") { "$env:JAVA_HOME_21_X64\bin\java.exe" }
-               else { $null }
-          if ($j) { & $j -version 2>&1 | Select-Object -First 1 }
-          else { Write-Host "Java not found on PATH" -ForegroundColor Red }
-
-      - name: 8. Keep server alive (up to 6h) + connection info
-        env:
-          CF_URL: ${{ env.CF_URL }}
-          CF_RDP_URL: ${{ env.CF_RDP_URL }}
-        run: |
-          Write-Host ""
-          Write-Host "==============================================================" -ForegroundColor Green
-          Write-Host "   >>> OPEN THIS URL IN YOUR BROWSER (any device) <<<" -ForegroundColor Cyan
-          Write-Host "       $env:CF_URL"
-          Write-Host ""
-          Write-Host "   Web login : Cynet" -ForegroundColor Yellow
-          Write-Host "   Password  : Cynet@2026" -ForegroundColor Yellow
-          Write-Host ""
-          Write-Host "   In the browser, once logged in:"
-          Write-Host "     1. My Devices -> Add Device Group -> type 'Local Devices (No Agent)'"
-          Write-Host "     2. Add Device -> type Windows -> address 127.0.0.1"
-          Write-Host "     3. Open the device -> RDP tab -> host 127.0.0.1"
-          Write-Host "        user CynetAdmin / password Cynet@2026 -> Connect"
-          Write-Host ""
-          Write-Host "   Native RDP fallback (mstsc on YOUR pc, needs cloudflared):" -ForegroundColor Cyan
-          Write-Host "     cloudflared access rdp --hostname $($env:CF_RDP_URL -replace '^https://','') --url rdp://localhost:3390"
-          Write-Host "     then mstsc -> localhost:3390 -> CynetAdmin / Cynet@2026"
-          Write-Host "==============================================================" -ForegroundColor Green
-
-          for ($i = 1; $i -le 340; $i++) {
-            Start-Sleep -Seconds 60
-            $cf  = if (Get-Process cloudflared -ErrorAction SilentlyContinue) { "OK" } else { "DOWN" }
-            $web = try { (Invoke-WebRequest "http://localhost:8080" -UseBasicParsing -TimeoutSec 5).StatusCode } catch { "DOWN" }
-            Write-Host "[$i/340] cloudflared:$cf | meshcentral:$web"
-          }
+          Write-Host ">>> Time's up - job ending, machine is gone. Re-run for a new session." -ForegroundColor Yellow
