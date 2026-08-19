@@ -81,32 +81,103 @@ jobs:
           Write-Host ">>> Installing bore tunnel client..." -ForegroundColor Cyan
 
           $ProgressPreference = 'SilentlyContinue'
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
           $boreDir = "C:\bore"
           $boreExe = "$boreDir\bore.exe"
-          $zipPath = "$boreDir\bore.zip"
+          New-Item -ItemType Directory -Path $boreDir -Force | Out-Null
 
-          if (-not (Test-Path $boreExe)) {
-            New-Item -ItemType Directory -Path $boreDir -Force | Out-Null
-
-            # Pin to a known-good version (bypass GitHub API which can rate-limit on runners)
-            $version = "0.5.2"
-            $url     = "https://github.com/ekzhang/bore/releases/download/v${version}/bore-v${version}-x86_64-windows.zip"
-
-            Write-Host "    Downloading: $url"
-            # curl.exe is faster and more reliable than Invoke-WebRequest on runners
-            curl.exe -L --retry 3 --retry-delay 2 --connect-timeout 30 -o $zipPath $url
-            if ($LASTEXITCODE -ne 0) { throw "bore download failed (exit $LASTEXITCODE)" }
-
-            Expand-Archive -Path $zipPath -DestinationPath $boreDir -Force
-            Remove-Item $zipPath -Force
-          } else {
+          if (Test-Path $boreExe) {
             Write-Host "    bore already installed, skipping download." -ForegroundColor Yellow
+            & $boreExe --version
+            return
           }
 
-          if (-not (Test-Path $boreExe)) { throw "bore.exe not found after install" }
+          # Multiple sources in priority order — try each until one works
+          $version = "0.5.2"
+          $urls = @(
+            @{ url = "https://github.com/ekzhang/bore/releases/download/v${version}/bore-v${version}-x86_64-windows.zip"; type = "zip" }
+            @{ url = "https://github.com/ekzhang/bore/releases/download/v${version}/bore-v${version}-x86_64-pc-windows-msvc.zip"; type = "zip" }
+            # Fallback: direct .exe if a build is published as a single binary
+            @{ url = "https://github.com/ekzhang/bore/releases/download/v${version}/bore.exe"; type = "exe" }
+          )
+
+          $downloaded = $false
+          $zipPath    = "$boreDir\bore.zip"
+
+          foreach ($u in $urls) {
+            $url  = $u.url
+            $type = $u.type
+            Write-Host "    Trying: $url" -ForegroundColor DarkGray
+
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
+
+            try {
+              if ($type -eq "exe") {
+                # Direct exe download
+                curl.exe -L --retry 3 --retry-delay 2 --connect-timeout 30 -o $boreExe $url 2>&1 | Out-Null
+              } else {
+                curl.exe -L --retry 3 --retry-delay 2 --connect-timeout 30 -o $zipPath $url 2>&1 | Out-Null
+              }
+
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "    curl exit code: $LASTEXITCODE" -ForegroundColor Yellow
+                continue
+              }
+
+              # Verify the file is actually a zip (PK header = 50 4B 03 04) or exe (MZ = 4D 5A)
+              if ($type -eq "zip") {
+                if (-not (Test-Path $zipPath)) { continue }
+                $size = (Get-Item $zipPath).Length
+                Write-Host "    Downloaded $size bytes" -ForegroundColor DarkGray
+                if ($size -lt 10000) {
+                  Write-Host "    File too small, likely error page. Contents:" -ForegroundColor Yellow
+                  Get-Content $zipPath -Raw | Write-Host
+                  continue
+                }
+                # Check magic bytes
+                $bytes = [System.IO.File]::ReadAllBytes($zipPath)[0..3]
+                $magic = ($bytes | ForEach-Object { $_.ToString("X2") }) -join " "
+                Write-Host "    Magic bytes: $magic" -ForegroundColor DarkGray
+                if ($magic -ne "50 4B 03 04") {
+                  Write-Host "    Not a valid zip file." -ForegroundColor Yellow
+                  continue
+                }
+
+                Expand-Archive -Path $zipPath -DestinationPath $boreDir -Force
+                Remove-Item $zipPath -Force
+              } else {
+                $size = (Get-Item $boreExe).Length
+                if ($size -lt 10000) { continue }
+              }
+
+              if (Test-Path $boreExe) {
+                $downloaded = $true
+                Write-Host "    Download successful." -ForegroundColor Green
+                break
+              }
+            } catch {
+              Write-Host "    Failed: $_" -ForegroundColor Yellow
+            }
+          }
+
+          if (-not $downloaded) {
+            Write-Host ">>> All download sources failed. Trying cargo/compile fallback..." -ForegroundColor Yellow
+            # Last resort: try to install via cargo (requires Rust toolchain)
+            if (Get-Command cargo -ErrorAction SilentlyContinue) {
+              cargo install bore-cli
+            } else {
+              throw "Could not download bore from any source. Network may be blocked."
+            }
+          }
+
+          if (-not (Test-Path $boreExe)) {
+            Get-ChildItem $boreDir | ForEach-Object { Write-Host "    found: $($_.Name) ($($_.Length) bytes)" }
+            throw "bore.exe not found after install"
+          }
 
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + $boreDir
-          $ver = & $boreExe --version
+          $ver = & $boreExe --version 2>&1
           Write-Host ">>> bore installed: $ver" -ForegroundColor Green
 
       - name: 4. Start bore tunnel for RDP (port 3389)
