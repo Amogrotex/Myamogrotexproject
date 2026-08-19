@@ -1,4 +1,4 @@
-name: Windows Cloud RDP (bore tunnel)
+name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
@@ -6,366 +6,166 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
-
-    permissions:
-      contents: read
+    timeout-minutes: 999
 
     steps:
       - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
-        shell: pwsh
         run: |
-          Write-Host ">>> Enabling RDP + firewall rules + performance tweaks..." -ForegroundColor Cyan
-
-          # --- Enable RDP ---
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
-
-          # --- Firewall: open RDP (TCP + UDP) ---
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
-
-          # --- Disable NLA (so mstsc with just creds works) ---
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-          # --- Group policy: allow UDP transport, color depth, compression ---
+          # --- RDP performance tuning (server-side) ---
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          if (-not (Test-Path $tsPol)) { New-Item -Path $tsPol -Force | Out-Null }
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport"     -Value 1  -Type DWord -Force
-          Set-ItemProperty -Path $tsPol -Name "ColorDepth"          -Value 24 -Type DWord -Force
-          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1  -Type DWord -Force
+          New-Item -Path $tsPol -Force | Out-Null
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
+          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
 
-          # --- High performance power plan ---
+          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
 
-          # --- Verify RDP service is running ---
-          $svc = Get-Service -Name TermService -ErrorAction SilentlyContinue
-          if ($svc.Status -ne 'Running') { Start-Service TermService }
-
-          # --- Confirm port 3389 is listening ---
-          Start-Sleep -Seconds 2
-          $port = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-          if ($port) {
-            Write-Host ">>> RDP listening on port 3389." -ForegroundColor Green
-          } else {
-            Write-Host ">>> WARN: Port 3389 not yet listening, will retry after reboot step." -ForegroundColor Yellow
-          }
+          Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
 
       - name: 2. Create Admin Account
-        shell: pwsh
         run: |
-          Write-Host ">>> Creating admin account..." -ForegroundColor Cyan
-
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
-          $User     = "CynetAdmin"
+          New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
+          net user runneradmin Cynet@2026
 
-          if (-not (Get-LocalUser -Name $User -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $User -Password $Password -PasswordNeverExpires -AccountNeverExpires | Out-Null
-            Write-Host "    User '$User' created." -ForegroundColor Green
-          } else {
-            Write-Host "    User '$User' already exists, updating password." -ForegroundColor Yellow
-            Set-LocalUser -Name $User -Password $Password
-          }
+      - name: 3a. Cache Tailscale Installer (skip re-download every run)
+        id: ts-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\tailscale.msi
+          key: tailscale-msi-v1
 
-          Add-LocalGroupMember -Group "Administrators" -Member $User -ErrorAction SilentlyContinue
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $User -ErrorAction SilentlyContinue
-
-          # Also reset the default runneradmin password so either account works
-          net user runneradmin Cynet@2026 | Out-Null
-
-          Write-Host ">>> Admin account ready: $User / Cynet@2026" -ForegroundColor Green
-
-      - name: 3. Install bore (no-account TCP tunnel)
-        shell: pwsh
+      - name: 3b. Install & Connect Tailscale (optimized)
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          Write-Host ">>> Installing bore tunnel client..." -ForegroundColor Cyan
-
+          # Kill PowerShell's progress bar rendering -> 5-10x faster downloads
           $ProgressPreference = 'SilentlyContinue'
-          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-          $boreDir = "C:\bore"
-          $boreExe = "$boreDir\bore.exe"
-          New-Item -ItemType Directory -Path $boreDir -Force | Out-Null
+          # Download only on cache miss (curl.exe is much faster than Invoke-WebRequest)
+          if (-not (Test-Path "C:\tailscale.msi")) {
+            curl.exe -L --retry 3 --retry-delay 2 -o "C:\tailscale.msi" "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          }
+          Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
 
-          if (Test-Path $boreExe) {
-            Write-Host "    bore already installed, skipping download." -ForegroundColor Yellow
-            & $boreExe --version
-            return
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+          # --reset clears stale state; skip features we don't use = faster startup
+          # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
+          # NOTE: --netfilter-mode was REMOVED from current Tailscale Windows builds,
+          # so it is intentionally not used here.
+          & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
+                   --reset --ssh=false --accept-dns=false
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host ">>> tailscale up FAILED (exit code $LASTEXITCODE)." -ForegroundColor Red
+            Write-Host "    Check that TAILSCALE_AUTHKEY secret is set, valid and reusable:" -ForegroundColor Red
+            Write-Host "    https://login.tailscale.com/admin/settings/keys" -ForegroundColor Red
+            throw "Tailscale login failed - job aborted."
           }
 
-          # Multiple sources in priority order — try each until one works
-          $version = "0.5.2"
-          $urls = @(
-            @{ url = "https://github.com/ekzhang/bore/releases/download/v${version}/bore-v${version}-x86_64-windows.zip"; type = "zip" }
-            @{ url = "https://github.com/ekzhang/bore/releases/download/v${version}/bore-v${version}-x86_64-pc-windows-msvc.zip"; type = "zip" }
-            # Fallback: direct .exe if a build is published as a single binary
-            @{ url = "https://github.com/ekzhang/bore/releases/download/v${version}/bore.exe"; type = "exe" }
-          )
+          # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
+          # while tailscaled finishes starting up)
+          $ts_ip = $null
+          for ($i = 1; $i -le 40; $i++) {
+            $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
+            if ($raw) {
+              $ts_ip = ([string]$raw).Trim()
+              break
+            }
+            Start-Sleep -Milliseconds 500
+          }
 
-          $downloaded = $false
-          $zipPath    = "$boreDir\bore.zip"
-
-          foreach ($u in $urls) {
-            $url  = $u.url
-            $type = $u.type
-            Write-Host "    Trying: $url" -ForegroundColor DarkGray
-
-            if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-
+          # Fallback 1: read the IP from 'status --json' (works even while the
+          # 'ip' subcommand misbehaves)
+          if (-not $ts_ip) {
             try {
-              if ($type -eq "exe") {
-                # Direct exe download
-                curl.exe -L --retry 3 --retry-delay 2 --connect-timeout 30 -o $boreExe $url 2>&1 | Out-Null
-              } else {
-                curl.exe -L --retry 3 --retry-delay 2 --connect-timeout 30 -o $zipPath $url 2>&1 | Out-Null
+              $stSelf = & $ts status --json 2>$null | ConvertFrom-Json
+              if ($stSelf.Self.TailscaleIPs) {
+                $ts_ip = [string]$stSelf.Self.TailscaleIPs[0]
               }
+            } catch { }
+          }
 
-              if ($LASTEXITCODE -ne 0) {
-                Write-Host "    curl exit code: $LASTEXITCODE" -ForegroundColor Yellow
-                continue
-              }
+          # Fallback 2: show unfiltered diagnostics instead of failing silently
+          if (-not $ts_ip) {
+            Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
+            & $ts status
+            & $ts ip -4
+          }
 
-              # Verify the file is actually a zip (PK header = 50 4B 03 04) or exe (MZ = 4D 5A)
-              if ($type -eq "zip") {
-                if (-not (Test-Path $zipPath)) { continue }
-                $size = (Get-Item $zipPath).Length
-                Write-Host "    Downloaded $size bytes" -ForegroundColor DarkGray
-                if ($size -lt 10000) {
-                  Write-Host "    File too small, likely error page. Contents:" -ForegroundColor Yellow
-                  Get-Content $zipPath -Raw | Write-Host
-                  continue
-                }
-                # Check magic bytes
-                $bytes = [System.IO.File]::ReadAllBytes($zipPath)[0..3]
-                $magic = ($bytes | ForEach-Object { $_.ToString("X2") }) -join " "
-                Write-Host "    Magic bytes: $magic" -ForegroundColor DarkGray
-                if ($magic -ne "50 4B 03 04") {
-                  Write-Host "    Not a valid zip file." -ForegroundColor Yellow
-                  continue
-                }
-
-                Expand-Archive -Path $zipPath -DestinationPath $boreDir -Force
-                Remove-Item $zipPath -Force
-              } else {
-                $size = (Get-Item $boreExe).Length
-                if ($size -lt 10000) { continue }
-              }
-
-              if (Test-Path $boreExe) {
-                $downloaded = $true
-                Write-Host "    Download successful." -ForegroundColor Green
-                break
-              }
-            } catch {
-              Write-Host "    Failed: $_" -ForegroundColor Yellow
+          # Fast relay check via JSON (no slow netcheck probes)
+          $direct = $false
+          try {
+            $st = & $ts status --json 2>$null | ConvertFrom-Json
+            $peer = $st.Peer.Values | Select-Object -First 1
+            if ($peer) {
+              $direct = [string]::IsNullOrEmpty([string]$peer.Relay)
+              $derp  = if ($peer.Relay) { $peer.Relay } else { "direct (no relay)" }
             }
-          }
-
-          if (-not $downloaded) {
-            Write-Host ">>> All download sources failed. Trying cargo/compile fallback..." -ForegroundColor Yellow
-            # Last resort: try to install via cargo (requires Rust toolchain)
-            if (Get-Command cargo -ErrorAction SilentlyContinue) {
-              cargo install bore-cli
-            } else {
-              throw "Could not download bore from any source. Network may be blocked."
-            }
-          }
-
-          if (-not (Test-Path $boreExe)) {
-            Get-ChildItem $boreDir | ForEach-Object { Write-Host "    found: $($_.Name) ($($_.Length) bytes)" }
-            throw "bore.exe not found after install"
-          }
-
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + $boreDir
-          $ver = & $boreExe --version 2>&1
-          Write-Host ">>> bore installed: $ver" -ForegroundColor Green
-
-      - name: 4. Start bore tunnel for RDP (port 3389)
-        shell: pwsh
-        run: |
-          Write-Host ">>> Starting bore tunnel for RDP (port 3389)..." -ForegroundColor Cyan
-
-          $boreDir   = "C:\bore"
-          $boreExe   = "$boreDir\bore.exe"
-          $logPath   = "C:\bore.log"
-          $errPath   = "C:\bore.err"
-          $addrFile  = "C:\rdp_address.txt"
-          $pidFile   = "C:\bore.pid"
-
-          # Clean any previous run
-          if (Test-Path $logPath)  { Remove-Item $logPath  -Force }
-          if (Test-Path $errPath)  { Remove-Item $errPath  -Force }
-          if (Test-Path $addrFile) { Remove-Item $addrFile -Force }
-          if (Test-Path $pidFile)  { Remove-Item $pidFile  -Force }
-
-          # Launch bore in background (hidden window, redirected I/O)
-          $proc = Start-Process -FilePath $boreExe `
-                                -ArgumentList "local","3389","--to","bore.pub" `
-                                -RedirectStandardOutput $logPath `
-                                -RedirectStandardError  $errPath `
-                                -WindowStyle Hidden `
-                                -PassThru
-
-          $proc.Id | Out-File -FilePath $pidFile -Encoding ASCII -NoNewline
-          Write-Host "    bore launched (PID $($proc.Id)). Waiting for tunnel handshake..." -ForegroundColor Cyan
-
-          # Poll the log for the public address (bore prints "Listening at bore.pub:PORT")
-          $publicAddr = $null
-          for ($i = 1; $i -le 60; $i++) {
-            Start-Sleep -Seconds 2
-            if (Test-Path $logPath) {
-              $content = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-              if ($content -match "Listening at (bore\.pub:\d+)") {
-                $publicAddr = $Matches[1]
-                break
-              }
-              if ($content -match "error|failed|timeout", "IgnoreCase") {
-                Write-Host "    bore reported an error. Log so far:" -ForegroundColor Yellow
-                Write-Host $content
-              }
-            }
-            if (Test-Path $errPath) {
-              $err = Get-Content $errPath -Raw -ErrorAction SilentlyContinue
-              if ($err -and $err.Trim().Length -gt 0) {
-                Write-Host "    [bore stderr] $err" -ForegroundColor DarkYellow
-              }
-            }
-          }
-
-          if (-not $publicAddr) {
-            Write-Host ">>> bore tunnel did not become ready in time." -ForegroundColor Red
-            Write-Host "--- stdout ---" -ForegroundColor Red
-            if (Test-Path $logPath) { Get-Content $logPath }
-            Write-Host "--- stderr ---" -ForegroundColor Red
-            if (Test-Path $errPath) { Get-Content $errPath }
-            # Don't fail the job - user might still want to debug, and the keep-alive step will run
-            $publicAddr = "bore.pub:NOT_READY - check logs"
-          }
-
-          $publicAddr | Out-File -FilePath $addrFile -Encoding ASCII -NoNewline
-
-          # Verify bore is still alive
-          $stillAlive = Get-Process -Id $proc.Id -ErrorAction SilentlyContinue
-          if ($stillAlive) {
-            Write-Host "    bore process is alive." -ForegroundColor Green
-          } else {
-            Write-Host ">>> WARN: bore process exited unexpectedly." -ForegroundColor Red
-          }
-
-          # Verify local RDP is still listening
-          $rdp = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-          if ($rdp) {
-            Write-Host "    Local RDP is listening on 3389." -ForegroundColor Green
-          } else {
-            Write-Host ">>> WARN: Local RDP not listening on 3389." -ForegroundColor Red
-          }
+          } catch { }
 
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! <<<"                   -ForegroundColor Cyan
-          Write-Host "  Public Address : $publicAddr"                   -ForegroundColor Yellow
-          Write-Host "  Username       : CynetAdmin"                    -ForegroundColor Yellow
-          Write-Host "  Password       : Cynet@2026"                    -ForegroundColor Yellow
-          Write-Host "  >> Open mstsc and connect to: $publicAddr"       -ForegroundColor Magenta
+          Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
+          Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
+          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
+          if (-not $direct) {
+            Write-Host "  WARN: relayed connection will be slow. Tips below." -ForegroundColor Red
+          }
+          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Health check + auto-restart
-        shell: pwsh
+          # If relayed, help the user fix it
+          if (-not $direct) {
+            Write-Host ""
+            Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
+            Write-Host " 1. Install Tailscale on YOUR PC too and log into the same account (tailscale.com/download)"
+            Write-Host " 2. Check 'tailscale status' on your PC - both machines should show 'direct'"
+            Write-Host " 3. Relayed usually means: closed UDP port 41641, CGNAT, or strict corporate firewall"
+            Write-Host " 4. On your PC: tailscale up --netfilter-mode=off  (removes firewall overhead)"
+            Write-Host " 5. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
+          }
+
+      - name: 4. Install Python & Java (Adoptium Temurin 21)
         run: |
-          Write-Host ">>> Watching tunnel + RDP, will auto-restart if they die." -ForegroundColor Cyan
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
+          Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
+          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
 
-          $boreDir   = "C:\bore"
-          $boreExe   = "$boreDir\bore.exe"
-          $logPath   = "C:\bore.log"
-          $errPath   = "C:\bore.err"
-          $pidFile   = "C:\bore.pid"
-          $addrFile  = "C:\rdp_address.txt"
+          Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
+          Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
+          Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
+          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
 
-          function Get-BoreStatus {
-            $pid_ = $null
-            if (Test-Path $pidFile) { $pid_ = [int](Get-Content $pidFile -Raw -ErrorAction SilentlyContinue) }
-            if ($pid_ -and (Get-Process -Id $pid_ -ErrorAction SilentlyContinue)) {
-              return "running"
-            }
-            return "dead"
-          }
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
+          $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
+          if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
+          else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
+          $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
+          if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
+          else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
+          Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
+          Write-Host "==================================================" -ForegroundColor Green
 
-          function Restart-Bore {
-            Write-Host "    >>> Restarting bore..." -ForegroundColor Yellow
-            if (Test-Path $logPath) { Remove-Item $logPath -Force }
-            if (Test-Path $errPath) { Remove-Item $errPath -Force }
-
-            $p = Start-Process -FilePath $boreExe `
-                               -ArgumentList "local","3389","--to","bore.pub" `
-                               -RedirectStandardOutput $logPath `
-                               -RedirectStandardError  $errPath `
-                               -WindowStyle Hidden `
-                               -PassThru
-            $p.Id | Out-File -FilePath $pidFile -Encoding ASCII -NoNewline
-            Start-Sleep -Seconds 5
-
-            $addr = $null
-            for ($i = 1; $i -le 30; $i++) {
-              if (Test-Path $logPath) {
-                $c = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
-                if ($c -match "Listening at (bore\.pub:\d+)") { $addr = $Matches[1]; break }
-              }
-              Start-Sleep -Seconds 2
-            }
-            if ($addr) {
-              $addr | Out-File -FilePath $addrFile -Encoding ASCII -NoNewline
-              Write-Host "    >>> bore back up at $addr" -ForegroundColor Green
-            } else {
-              Write-Host "    >>> bore restart failed." -ForegroundColor Red
-            }
-          }
-
-          # 6 hours = 360 minutes. Loop every minute.
-          for ($i = 1; $i -le 360; $i++) {
-            # --- Check bore ---
-            $boreStatus = Get-BoreStatus
-            if ($boreStatus -eq "dead") {
-              Write-Host "[$i/360] bore is DEAD, restarting..." -ForegroundColor Red
-              Restart-Bore
-            }
-
-            # --- Check RDP service ---
-            $rdpSvc = Get-Service -Name TermService -ErrorAction SilentlyContinue
-            if ($rdpSvc -and $rdpSvc.Status -ne 'Running') {
-              Write-Host "[$i/360] TermService not running, starting..." -ForegroundColor Yellow
-              Start-Service TermService -ErrorAction SilentlyContinue
-            }
-
-            # --- Periodic summary every 30 min ---
-            $addr = if (Test-Path $addrFile) { (Get-Content $addrFile -Raw).Trim() } else { "n/a" }
-            if (($i % 30) -eq 0) {
-              Write-Host ""
-              Write-Host "==================================================" -ForegroundColor Green
-              Write-Host "  STATUS @ minute $i"                                  -ForegroundColor Cyan
-              Write-Host "  Tunnel : $addr"                                       -ForegroundColor Yellow
-              Write-Host "  bore   : $boreStatus"                                 -ForegroundColor Yellow
-              Write-Host "  RDP    : $($rdpSvc.Status)"                           -ForegroundColor Yellow
-              Write-Host "==================================================" -ForegroundColor Green
-            } else {
-              Write-Host "[$i/360] alive | tunnel=$addr | bore=$boreStatus | rdp=$($rdpSvc.Status)"
-            }
-
+      - name: 5. Keep Server Alive (6 Hours)
+        run: |
+          for ($i = 1; $i -le 999; $i++) {
             Start-Sleep -Seconds 60
+            Write-Host "[$i/999] Server running..."
           }
-
-      - name: 6. Cleanup (on cancellation or finish)
-        if: always()
-        shell: pwsh
-        run: |
-          Write-Host ">>> Cleanup: stopping bore..." -ForegroundColor Cyan
-          $pidFile = "C:\bore.pid"
-          if (Test-Path $pidFile) {
-            $pid_ = [int](Get-Content $pidFile -Raw -ErrorAction SilentlyContinue)
-            if ($pid_) {
-              Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
-              Write-Host "    Stopped bore (PID $pid_)" -ForegroundColor Green
-            }
-          }
-          # Disable RDP so the next job starts clean
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 1 -ErrorAction SilentlyContinue
-          Write-Host ">>> Cleanup complete." -ForegroundColor Green
