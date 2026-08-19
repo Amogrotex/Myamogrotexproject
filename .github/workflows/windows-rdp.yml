@@ -3,31 +3,174 @@ name: Windows Cloud RDP
 on:
   workflow_dispatch:
 
+concurrency:
+  group: windows-cloud-rdp
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 999
+    timeout-minutes: 360
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      PERSIST_BRANCH: persist/d-drive
+      PERSIST_DIR: C:\rdp-persist
 
     steps:
+      - name: 0. Persist helpers (7-Zip + save/restore scripts)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path $env:PERSIST_DIR -Force | Out-Null
+
+          if (-not (Test-Path 'C:\Program Files\7-Zip\7z.exe')) {
+            choco install 7zip -y --no-progress
+          }
+
+          # GitHub Actions strips the common indent, so the here-string closers land at column 0.
+          Set-Content -Path "$env:PERSIST_DIR\Ensure-DDrive.ps1" -Encoding UTF8 @'
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path 'D:\') {
+            Write-Host ">>> D: already present."
+          } else {
+            $root = 'C:\D_Drive'
+            New-Item -ItemType Directory -Path $root -Force | Out-Null
+            subst D: $root
+            if (-not (Test-Path 'D:\')) { throw 'Failed to create D: (subst)' }
+            Write-Host ">>> D: was missing on this runner. Mapped D: -> $root"
+          }
+          Set-Content -Path 'D:\README-PERSIST.txt' -Encoding UTF8 -Value 'Only D: is saved to repo branch persist/d-drive and restored next session. C: is wiped every run. Do not store files in D:\a (runner workspace, skipped). Auto-save on RDP disconnect, every 30 min, and when the job ends.'
+          '@
+
+          Set-Content -Path "$env:PERSIST_DIR\Git-Auth.ps1" -Encoding UTF8 @'
+          # Configure git HTTPS auth for this process without printing the token.
+          $token = $env:GITHUB_TOKEN
+          if ([string]::IsNullOrEmpty($token)) { throw 'GITHUB_TOKEN is empty (need permissions: contents: write)' }
+          $b64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("x-access-token:$token"))
+          git config --global --unset-all http.https://github.com/.extraheader 2>$null
+          git config --global http.https://github.com/.extraheader "AUTHORIZATION: basic $b64"
+          git config --global user.name  "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          '@
+
+          Set-Content -Path "$env:PERSIST_DIR\Restore-DDrive.ps1" -Encoding UTF8 @'
+          $ErrorActionPreference = 'Continue'
+          Write-Host ">>> Restoring D: from repo branch $($env:PERSIST_BRANCH) ..."
+          . "$env:PERSIST_DIR\Git-Auth.ps1"
+
+          $work = Join-Path $env:PERSIST_DIR 'restore'
+          if (Test-Path $work) { Remove-Item $work -Recurse -Force }
+          $url = "https://github.com/$($env:GITHUB_REPOSITORY).git"
+
+          $heads = git ls-remote --heads $url $env:PERSIST_BRANCH 2>$null
+          if (-not $heads) {
+            Write-Host ">>> No snapshot yet (first run). D: starts empty."
+            exit 0
+          }
+
+          git clone --depth 1 --branch $env:PERSIST_BRANCH --single-branch $url $work
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host ">>> WARN: clone of persist branch failed. Starting with empty D:."
+            exit 0
+          }
+
+          $archive = Join-Path $work 'D-drive.7z'
+          if (-not (Test-Path $archive)) {
+            Write-Host ">>> Persist branch has no D-drive.7z. Starting with empty D:."
+            exit 0
+          }
+
+          $7z = 'C:\Program Files\7-Zip\7z.exe'
+          & $7z x $archive "-oD:\" -y
+          if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) {
+            Write-Host ">>> WARN: 7z extract returned $LASTEXITCODE"
+            exit 0
+          }
+          Write-Host ">>> D: restored OK."
+          '@
+
+          Set-Content -Path "$env:PERSIST_DIR\Save-DDrive.ps1" -Encoding UTF8 @'
+          $ErrorActionPreference = 'Stop'
+          $lock = Join-Path $env:PERSIST_DIR 'save.lock'
+          if (Test-Path $lock) {
+            $ageMin = ((Get-Date) - (Get-Item $lock).LastWriteTime).TotalMinutes
+            if ($ageMin -lt 25) {
+              Write-Host ">>> Save already in progress. Skipping."
+              exit 0
+            }
+          }
+          New-Item $lock -Force | Out-Null
+          try {
+            if (-not (Test-Path 'D:\')) { throw 'D: not found' }
+            . "$env:PERSIST_DIR\Git-Auth.ps1"
+
+            $work = Join-Path $env:PERSIST_DIR 'work'
+            if (Test-Path $work) { Remove-Item $work -Recurse -Force }
+            New-Item $work -ItemType Directory -Force | Out-Null
+            $archive = Join-Path $work 'D-drive.7z'
+            $7z = 'C:\Program Files\7-Zip\7z.exe'
+
+            Write-Host ">>> Packing D: (skipping D:\a runner workspace) ..."
+            & $7z a -t7z -mx=1 -mmt=on -ssw -bso0 -bsp1 `
+                $archive 'D:\*' `
+                '-xr!a' '-xr!a\*' `
+                '-xr!$RECYCLE.BIN' '-xr!$RECYCLE.BIN\*' `
+                '-xr!System Volume Information' '-xr!System Volume Information\*' `
+                '-xr!pagefile.sys' '-xr!swapfile.sys' '-xr!hiberfil.sys'
+            # 7z exit 1 = warning (usually locked files) — still usable
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 1) {
+              throw "7z failed with exit code $LASTEXITCODE"
+            }
+            if (-not (Test-Path $archive)) { throw 'Archive was not created' }
+
+            $size = (Get-Item $archive).Length
+            Write-Host (">>> Archive size: {0:N1} MB" -f ($size / 1MB))
+            if ($size -gt (1.9GB)) {
+              throw "Archive is $([math]::Round($size/1GB,2)) GB. GitHub LFS max is 2 GB. Delete files on D: and retry."
+            }
+            if ($size -lt 16) {
+              Write-Host ">>> Archive is empty-ish. Still pushing so the next session gets a clean D:."
+            }
+
+            Push-Location $work
+            git init -b $env:PERSIST_BRANCH | Out-Null
+            git lfs install --local | Out-Null
+            git lfs track "D-drive.7z" | Out-Null
+            git add .gitattributes D-drive.7z
+            git commit -m "D: snapshot $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')" | Out-Null
+            git remote add origin "https://github.com/$($env:GITHUB_REPOSITORY).git"
+            Write-Host ">>> Pushing snapshot to $($env:PERSIST_BRANCH) (force, single commit) ..."
+            git push -f origin "HEAD:$($env:PERSIST_BRANCH)"
+            if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
+            Pop-Location
+
+            Set-Content -Path (Join-Path $env:PERSIST_DIR 'last-save.txt') -Value (Get-Date -Format o)
+            Write-Host ">>> D: saved to repo branch $($env:PERSIST_BRANCH)."
+          }
+          finally {
+            Remove-Item $lock -Force -ErrorAction SilentlyContinue
+          }
+          '@
+
+          Write-Host ">>> Persist helpers ready."
+
       - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
 
-          # --- RDP performance tuning (server-side) ---
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $tsPol -Force | Out-Null
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
 
-          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
-
           Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
 
       - name: 2. Create Admin Account
@@ -36,6 +179,11 @@ jobs:
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
+
+      - name: 2b. Ensure D: exists + restore snapshot from repo
+        run: |
+          powershell -NoProfile -File "$env:PERSIST_DIR\Ensure-DDrive.ps1"
+          powershell -NoProfile -File "$env:PERSIST_DIR\Restore-DDrive.ps1"
 
       - name: 3a. Cache Tailscale Installer (skip re-download every run)
         id: ts-cache
@@ -48,10 +196,8 @@ jobs:
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Kill PowerShell's progress bar rendering -> 5-10x faster downloads
           $ProgressPreference = 'SilentlyContinue'
 
-          # Download only on cache miss (curl.exe is much faster than Invoke-WebRequest)
           if (-not (Test-Path "C:\tailscale.msi")) {
             curl.exe -L --retry 3 --retry-delay 2 -o "C:\tailscale.msi" "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           }
@@ -59,10 +205,6 @@ jobs:
 
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
 
-          # --reset clears stale state; skip features we don't use = faster startup
-          # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
-          # NOTE: --netfilter-mode was REMOVED from current Tailscale Windows builds,
-          # so it is intentionally not used here.
           & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
                    --reset --ssh=false --accept-dns=false
           if ($LASTEXITCODE -ne 0) {
@@ -72,8 +214,6 @@ jobs:
             throw "Tailscale login failed - job aborted."
           }
 
-          # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
-          # while tailscaled finishes starting up)
           $ts_ip = $null
           for ($i = 1; $i -le 40; $i++) {
             $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
@@ -84,8 +224,6 @@ jobs:
             Start-Sleep -Milliseconds 500
           }
 
-          # Fallback 1: read the IP from 'status --json' (works even while the
-          # 'ip' subcommand misbehaves)
           if (-not $ts_ip) {
             try {
               $stSelf = & $ts status --json 2>$null | ConvertFrom-Json
@@ -95,14 +233,12 @@ jobs:
             } catch { }
           }
 
-          # Fallback 2: show unfiltered diagnostics instead of failing silently
           if (-not $ts_ip) {
             Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
             & $ts status
             & $ts ip -4
           }
 
-          # Fast relay check via JSON (no slow netcheck probes)
           $direct = $false
           try {
             $st = & $ts status --json 2>$null | ConvertFrom-Json
@@ -119,14 +255,15 @@ jobs:
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
           Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "  Persist      : D:  <->  repo branch persist/d-drive" -ForegroundColor Yellow
           Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
           if (-not $direct) {
             Write-Host "  WARN: relayed connection will be slow. Tips below." -ForegroundColor Red
           }
           Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  >> Put YOUR files on D:  (C: is wiped every run)" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
 
-          # If relayed, help the user fix it
           if (-not $direct) {
             Write-Host ""
             Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
@@ -163,9 +300,49 @@ jobs:
           Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
 
-      - name: 5. Keep Server Alive (6 Hours)
+      - name: 5. Keep Server Alive (6 Hours) + autosave D: on disconnect
         run: |
-          for ($i = 1; $i -le 999; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/999] Server running..."
+          function Get-RdpUserState {
+            $lines = @(qwinsta 2>$null)
+            foreach ($line in $lines) {
+              if ($line -match 'CynetAdmin') {
+                if ($line -match 'Active') { return 'Active' }
+                if ($line -match 'Disc')   { return 'Disc' }
+              }
+            }
+            return 'None'
           }
+
+          $lastState = 'None'
+          $lastSave  = Get-Date
+          $interval  = [TimeSpan]::FromMinutes(30)
+
+          for ($i = 1; $i -le 360; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "[$i/360] Server running..."
+
+            $state = Get-RdpUserState
+            $disconnected = ($lastState -eq 'Active' -and $state -ne 'Active')
+            $due = ((Get-Date) - $lastSave) -ge $interval
+
+            if ($disconnected -or $due) {
+              if ($disconnected) {
+                Write-Host ">>> RDP lost ($lastState -> $state). Saving D: to repo ..." -ForegroundColor Cyan
+              } else {
+                Write-Host ">>> Periodic autosave (30 min). Saving D: to repo ..." -ForegroundColor Cyan
+              }
+              try {
+                powershell -NoProfile -File "$env:PERSIST_DIR\Save-DDrive.ps1"
+                $lastSave = Get-Date
+              } catch {
+                Write-Host ">>> WARN: save failed: $($_.Exception.Message)" -ForegroundColor Yellow
+              }
+            }
+            $lastState = $state
+          }
+
+      - name: 6. Save D: to repo (always — end, cancel, or timeout)
+        if: always()
+        run: |
+          Write-Host ">>> Job ending. Final save of D: ..."
+          powershell -NoProfile -File "$env:PERSIST_DIR\Save-DDrive.ps1"
