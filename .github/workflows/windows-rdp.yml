@@ -7,11 +7,10 @@
 #  client will very likely refuse to stream (kept here as requested).
 #
 #  STATIC IP CHANGES (see steps 4 & 4b):
-#    - The node is now registered with --ephemeral, so the moment the
-#      job ends the device is removed from your tailnet and its IP is
-#      freed up for the next run.
-#    - Step "4b" then pins a fixed IPv4 (TAILSCALE_STATIC_IP) onto the
-#      fresh node via the Tailscale HTTP API, so every session comes up
+#    - The Windows Tailscale client does NOT support the --ephemeral
+#      flag, so instead step "4b" deletes stale nodes left behind by
+#      previous sessions (via the API) to free the static IP, then pins
+#      TAILSCALE_STATIC_IP onto the fresh node. Every session comes up
 #      on the SAME address.
 # =====================================================================
 name: Windows Cloud RDP
@@ -207,10 +206,10 @@ jobs:
           }
           Get-ChildItem "$env:PERSIST_DIR" -ErrorAction SilentlyContinue | Select-Object Name, LastWriteTime | Format-Table
       # ---------------------------------------------------------------
-      #  --ephemeral: the device is auto-removed from your tailnet when
-      #  the job ends, which (a) stops old machines piling up and
-      #  (b) frees the static IP for the next run. The IP is then pinned
-      #  explicitly in step 4b below.
+      #  NOTE: the Windows client has no --ephemeral flag, so this node
+      #  stays in your tailnet after the job ends. Step 4b cleans up any
+      #  stale nodes from previous sessions via the API, which also frees
+      #  the static IP so it can be pinned to this run.
       # ---------------------------------------------------------------
       - name: 4. Install & Connect Tailscale (optimized)
         env:
@@ -223,7 +222,7 @@ jobs:
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
-                   --reset --ssh=false --accept-dns=false --ephemeral
+                   --reset --ssh=false --accept-dns=false
           if ($LASTEXITCODE -ne 0) {
             Write-Host ">>> tailscale up FAILED (exit code $LASTEXITCODE)." -ForegroundColor Red
             Write-Host "    Check that TAILSCALE_AUTHKEY secret is set, valid and reusable:" -ForegroundColor Red
@@ -275,10 +274,11 @@ jobs:
             Write-Host " 4. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
           }
       # ---------------------------------------------------------------
-      #  PIN THE STATIC IP. Runs right after 'tailscale up', reads the
-      #  node ID from 'tailscale status --json' and tells the control
-      #  server to use TAILSCALE_STATIC_IP instead of the random address
-      #  it just assigned. From now on every session answers on this IP.
+      #  STATIC IP. Runs right after 'tailscale up'. Because the Windows
+      #  client has no --ephemeral flag, old nodes from previous sessions
+      #  linger in the tailnet and can hold the static IP. So we:
+      #    1) delete any stale "github-rdp-server*" nodes (API), and
+      #    2) pin TAILSCALE_STATIC_IP onto the current node (API).
       # ---------------------------------------------------------------
       - name: "4b. Pin static Tailscale IP"
         env:
@@ -293,9 +293,27 @@ jobs:
             Write-Host ">>> WARN: could not read node ID - static IP NOT set." -ForegroundColor Yellow
             exit 0
           }
-          Write-Host ">>> Pinning IPv4 $ip onto node $nodeId ..." -ForegroundColor Cyan
           $headers = @{ Authorization = "Bearer $env:TAILSCALE_APIKEY" }
-          $body    = (@{ ipv4 = $ip } | ConvertTo-Json -Compress)
+
+          # 1) Clean up stale nodes from previous sessions (frees the IP)
+          Write-Host ">>> Checking for stale nodes to remove ..." -ForegroundColor Cyan
+          try {
+            $devices = Invoke-RestMethod -Method Get `
+              -Uri "https://api.tailscale.com/api/v2/tailnet/-/devices?fields=all" -Headers $headers
+            foreach ($d in $devices.devices) {
+              if ($d.id -ne $nodeId -and $d.hostname -like "github-rdp-server*") {
+                Write-Host "    removing stale node: $($d.hostname) ($($d.id))" -ForegroundColor DarkCyan
+                Invoke-RestMethod -Method Delete `
+                  -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers $headers | Out-Null
+              }
+            }
+          } catch {
+            Write-Host ">>> WARN: could not clean up stale nodes: $($_.Exception.Message)" -ForegroundColor Yellow
+          }
+
+          # 2) Pin the static IP
+          Write-Host ">>> Pinning IPv4 $ip onto node $nodeId ..." -ForegroundColor Cyan
+          $body = (@{ ipv4 = $ip } | ConvertTo-Json -Compress)
           try {
             Invoke-RestMethod -Method Post -Uri "https://api.tailscale.com/api/v2/device/$nodeId/ip" `
               -Headers $headers -Body $body -ContentType "application/json" | Out-Null
