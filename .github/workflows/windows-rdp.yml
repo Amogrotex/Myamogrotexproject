@@ -1,37 +1,105 @@
+# =====================================================================
+#  Windows Cloud RDP  (Tailscale + persistent D: drive + GeForce NOW)
+# ---------------------------------------------------------------------
+#  NOTE: GitHub-hosted runners are for CI only. Using them as a remote
+#  desktop / gaming box violates the GitHub Actions ToS and can get the
+#  account suspended. Also: runners have NO GPU, so the GeForce NOW
+#  client will very likely refuse to stream (kept here as requested).
+# =====================================================================
 name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
 
+env:
+  # Everything we want to survive between sessions lives here.
+  PERSIST_DIR: D:\Persist
+  BACKUP_DIR: D:\_backup
+  BACKUP_FILE: D:\_backup\dstate.7z
+  # How often (in minutes) the live snapshot of D:\Persist is refreshed.
+  SNAPSHOT_EVERY_MIN: 15
+  # Keep-alive length. Hosted jobs are hard-killed at 6 h, so we stop a
+  # bit earlier and exit cleanly => the backup step always completes.
+  KEEPALIVE_MINUTES: 340
+
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 999
+    timeout-minutes: 355
 
     steps:
+      # ---------------------------------------------------------------
+      - name: 0. Remove Chrome & Firefox (frees disk, as requested)
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          Write-Host ">>> Uninstalling Google Chrome ..." -ForegroundColor Cyan
+          # Chrome ships its own setup.exe next to the versioned binaries
+          Get-ChildItem "C:\Program Files\Google\Chrome\Application",
+                        "C:\Program Files (x86)\Google\Chrome\Application" `
+                        -Filter "setup.exe" -Recurse -ErrorAction SilentlyContinue |
+            ForEach-Object {
+              Start-Process $_.FullName `
+                -ArgumentList "--uninstall --system-level --force-uninstall" `
+                -Wait -ErrorAction SilentlyContinue
+            }
+          # Fallback via the registry uninstall strings (MSI / user-level installs)
+          $keys = @(
+            'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+          )
+          Get-ItemProperty $keys -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match 'Google Chrome|Mozilla Firefox|Mozilla Maintenance' } |
+            ForEach-Object {
+              $u = $_.UninstallString
+              Write-Host "    removing: $($_.DisplayName)"
+              if ($u -match 'msiexec') {
+                $code = ($u -replace '.*(\{[0-9A-Fa-f\-]{36}\}).*','$1')
+                Start-Process msiexec -ArgumentList "/x $code /quiet /norestart" -Wait -ErrorAction SilentlyContinue
+              } else {
+                $exe  = ($u -split '"')[1]; if (-not $exe) { $exe = ($u -split ' ')[0] }
+                Start-Process $exe -ArgumentList "/S" -Wait -ErrorAction SilentlyContinue
+              }
+            }
+          # Leftovers + the CI webdrivers nobody needs here
+          $paths = @(
+            "C:\Program Files\Google\Chrome", "C:\Program Files (x86)\Google\Chrome",
+            "C:\Program Files\Mozilla Firefox", "C:\Program Files (x86)\Mozilla Firefox",
+            "C:\Program Files (x86)\Mozilla Maintenance Service",
+            "$env:LOCALAPPDATA\Google\Chrome", "$env:APPDATA\Mozilla",
+            "C:\SeleniumWebDrivers"
+          )
+          foreach ($p in $paths) { Remove-Item $p -Recurse -Force -ErrorAction SilentlyContinue }
+          Get-PSDrive C, D | Select-Object Name,
+            @{n='FreeGB';e={[math]::Round($_.Free/1GB,1)}},
+            @{n='UsedGB';e={[math]::Round($_.Used/1GB,1)}} | Format-Table
+          Write-Host ">>> Chrome / Firefox removed." -ForegroundColor Green
+
+      # ---------------------------------------------------------------
       - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          # Explicitly enable the RDP UDP rule (UDP transport = much lower latency / loss)
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
-          # --- RDP performance tuning (server-side) ---
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $tsPol -Force | Out-Null
           Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
           Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
-          # --- High Performance power plan (no CPU throttling = smoother RDP) ---
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
           Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
+
+      # ---------------------------------------------------------------
       - name: 2. Create Admin Account
         run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
+
+      # ---------------------------------------------------------------
       - name: 3a. Cache Tailscale Installer (skip re-download every run)
         id: ts-cache
         uses: actions/cache@v4
@@ -39,22 +107,48 @@ jobs:
           path: C:\tailscale.msi
           key: tailscale-msi-v1
 
-      - name: 3b. Install & Connect Tailscale (optimized)
+      # ---------------------------------------------------------------
+      #  RESTORE the D: drive state saved by the PREVIOUS session.
+      #  key never hits (unique per run) -> restore-keys picks the newest
+      #  "dstate-" entry, i.e. the last session's backup.
+      # ---------------------------------------------------------------
+      - name: "3b. Restore previous session D: drive backup"
+        id: dstate
+        uses: actions/cache/restore@v4
+        with:
+          path: D:\_backup\dstate.7z
+          key: dstate-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            dstate-
+
+      - name: "3c. Unpack D: drive state"
+        shell: powershell
+        run: |
+          $7z = "C:\Program Files\7-Zip\7z.exe"
+          New-Item -ItemType Directory -Force -Path "$env:PERSIST_DIR", "$env:BACKUP_DIR" | Out-Null
+          if (Test-Path "$env:BACKUP_FILE") {
+            $sizeMB = [math]::Round((Get-Item "$env:BACKUP_FILE").Length/1MB,1)
+            Write-Host ">>> Found previous session backup ($sizeMB MB) - restoring to $env:PERSIST_DIR ..." -ForegroundColor Cyan
+            & $7z x "$env:BACKUP_FILE" "-oD:\" -aoa -bso0 -bsp0
+            Write-Host ">>> Restore complete." -ForegroundColor Green
+            "RESTORED=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          } else {
+            Write-Host ">>> No previous backup found - starting a fresh D: drive." -ForegroundColor Yellow
+            "RESTORED=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+          Get-ChildItem "$env:PERSIST_DIR" -ErrorAction SilentlyContinue | Select-Object Name, LastWriteTime | Format-Table
+
+      # ---------------------------------------------------------------
+      - name: 4. Install & Connect Tailscale (optimized)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          # Kill PowerShell's progress bar rendering -> 5-10x faster downloads
           $ProgressPreference = 'SilentlyContinue'
-          # Download only on cache miss (curl.exe is much faster than Invoke-WebRequest)
           if (-not (Test-Path "C:\tailscale.msi")) {
             curl.exe -L --retry 3 --retry-delay 2 -o "C:\tailscale.msi" "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           }
           Start-Process msiexec -ArgumentList "/i C:\tailscale.msi /quiet /norestart" -Wait
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
-          # --reset clears stale state; skip features we don't use = faster startup
-          # --ssh=false / --accept-dns=false : skip SSH server + DNS config we don't need
-          # NOTE: --netfilter-mode was REMOVED from current Tailscale Windows builds,
-          # so it is intentionally not used here.
           & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="github-rdp-server" `
                    --reset --ssh=false --accept-dns=false
           if ($LASTEXITCODE -ne 0) {
@@ -63,34 +157,23 @@ jobs:
             Write-Host "    https://login.tailscale.com/admin/settings/keys" -ForegroundColor Red
             throw "Tailscale login failed - job aborted."
           }
-          # Poll for IPv4 every 0.5s (null-safe: the command can return nothing
-          # while tailscaled finishes starting up)
           $ts_ip = $null
           for ($i = 1; $i -le 40; $i++) {
             $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
-            if ($raw) {
-              $ts_ip = ([string]$raw).Trim()
-              break
-            }
+            if ($raw) { $ts_ip = ([string]$raw).Trim(); break }
             Start-Sleep -Milliseconds 500
           }
-          # Fallback 1: read the IP from 'status --json' (works even while the
-          # 'ip' subcommand misbehaves)
           if (-not $ts_ip) {
             try {
               $stSelf = & $ts status --json 2>$null | ConvertFrom-Json
-              if ($stSelf.Self.TailscaleIPs) {
-                $ts_ip = [string]$stSelf.Self.TailscaleIPs[0]
-              }
+              if ($stSelf.Self.TailscaleIPs) { $ts_ip = [string]$stSelf.Self.TailscaleIPs[0] }
             } catch { }
           }
-          # Fallback 2: show unfiltered diagnostics instead of failing silently
           if (-not $ts_ip) {
             Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
             & $ts status
             & $ts ip -4
           }
-          # Fast relay check via JSON (no slow netcheck probes)
           $direct = $false
           try {
             $st = & $ts status --json 2>$null | ConvertFrom-Json
@@ -104,25 +187,23 @@ jobs:
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : CynetAdmin" -ForegroundColor Yellow
+          Write-Host "  Username     : runneradmin   (GeForce NOW is installed in THIS profile)" -ForegroundColor Yellow
+          Write-Host "  Alt user     : CynetAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
           Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
-          if (-not $direct) {
-            Write-Host "  WARN: relayed connection will be slow. Tips below." -ForegroundColor Red
-          }
           Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
-          # If relayed, help the user fix it
           if (-not $direct) {
             Write-Host ""
             Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
             Write-Host " 1. Install Tailscale on YOUR PC too and log into the same account (tailscale.com/download)"
             Write-Host " 2. Check 'tailscale status' on your PC - both machines should show 'direct'"
             Write-Host " 3. Relayed usually means: closed UDP port 41641, CGNAT, or strict corporate firewall"
-            Write-Host " 4. On your PC: tailscale up --netfilter-mode=off  (removes firewall overhead)"
-            Write-Host " 5. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
+            Write-Host " 4. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
           }
-      - name: 4. Install Python & Java (Adoptium Temurin 21)
+
+      # ---------------------------------------------------------------
+      - name: 5. Install Python & Java (Adoptium Temurin 21)
         run: |
           $ProgressPreference = 'SilentlyContinue'
           Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
@@ -134,7 +215,6 @@ jobs:
           Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
           Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
-          Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
           $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
@@ -142,12 +222,113 @@ jobs:
           else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
           $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
           if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
+          else           { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
           Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
-      - name: 5. Keep Server Alive (6 Hours)
+
+      # ---------------------------------------------------------------
+      #  GeForce NOW. The client always installs into
+      #  %LOCALAPPDATA%\NVIDIA Corporation\GeForceNOW (no /D switch), so
+      #  we junction that folder onto D:\Persist -> install + settings +
+      #  login state all live on D: and get backed up automatically.
+      # ---------------------------------------------------------------
+      - name: "6. Install GeForce NOW on D: (persistent)"
+        shell: powershell
         run: |
-          for ($i = 1; $i -le 999; $i++) {
-            Start-Sleep -Seconds 60
-            Write-Host "[$i/999] Server running..."
+          $ProgressPreference = 'SilentlyContinue'
+          $gfnData = "$env:PERSIST_DIR\GFN"                       # real folder on D:
+          $localNv = "$env:LOCALAPPDATA\NVIDIA Corporation"       # where GFN insists on living
+          New-Item -ItemType Directory -Force -Path $gfnData | Out-Null
+
+          # Point the profile folder at D: via a directory junction
+          if (Test-Path $localNv) {
+            $item = Get-Item $localNv -Force
+            if (-not ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+              robocopy $localNv $gfnData /E /MOVE /NFL /NDL /NJH /NJS /NC /NS | Out-Null
+              Remove-Item $localNv -Recurse -Force -ErrorAction SilentlyContinue
+            }
           }
+          if (-not (Test-Path $localNv)) { cmd /c mklink /J "$localNv" "$gfnData" | Out-Null }
+
+          # Same junction for anyone who logs in later (e.g. CynetAdmin)
+          $cmd = 'powershell -NoProfile -WindowStyle Hidden -Command "$t=Join-Path $env:LOCALAPPDATA ''NVIDIA Corporation''; if(-not (Test-Path $t)){ cmd /c mklink /J \"$t\" \"' + $gfnData + '\" }"'
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name 'LinkGFNToD' -Value $cmd -Force
+
+          $installed = Test-Path "$gfnData\GeForceNOW\CEF\GeForceNOW.exe"
+          if ($installed) {
+            Write-Host ">>> GeForce NOW restored from previous session - skipping download." -ForegroundColor Green
+          } else {
+            Write-Host ">>> Downloading GeForce NOW client ..." -ForegroundColor Cyan
+            $exe = "D:\GeForceNOW-release.exe"
+            curl.exe -L --retry 3 --retry-delay 2 -o $exe "https://download.nvidia.com/gfnpc/GeForceNOW-release.exe"
+            Write-Host ">>> Installing silently (-s -noreboot -nofinish) ..." -ForegroundColor Cyan
+            $p = Start-Process $exe -ArgumentList "-s -noreboot -nofinish -noeula" -Wait -PassThru -ErrorAction SilentlyContinue
+            Write-Host "    installer exit code: $($p.ExitCode)"
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+          }
+
+          # Desktop shortcut for the RDP session
+          $target = Get-ChildItem "$gfnData" -Filter "GeForceNOW.exe" -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+          if ($target) {
+            $ws = New-Object -ComObject WScript.Shell
+            foreach ($d in @("$env:PUBLIC\Desktop", "$env:USERPROFILE\Desktop")) {
+              if (Test-Path $d) {
+                $sc = $ws.CreateShortcut("$d\GeForce NOW.lnk")
+                $sc.TargetPath = $target.FullName
+                $sc.WorkingDirectory = $target.DirectoryName
+                $sc.Save()
+              }
+            }
+            Write-Host ">>> GeForce NOW ready: $($target.FullName)" -ForegroundColor Green
+          } else {
+            Write-Host ">>> WARN: GeForceNOW.exe not found after install." -ForegroundColor Yellow
+          }
+
+          # Reality check on the GPU situation
+          $gpu = (Get-CimInstance Win32_VideoController | Select-Object -Expand Name) -join ', '
+          Write-Host "  Display adapter: $gpu" -ForegroundColor Yellow
+          if ($gpu -notmatch 'NVIDIA|AMD|Intel') {
+            Write-Host "  WARN: no real GPU on this runner - GFN may refuse to stream (VM/unsupported GPU)." -ForegroundColor Red
+          }
+
+      # ---------------------------------------------------------------
+      #  Keep alive + rolling snapshot of D:\Persist. Snapshotting during
+      #  the session means that even if the job is cancelled/timed out,
+      #  the final save step only has to upload an already-built archive.
+      # ---------------------------------------------------------------
+      - name: "7. Keep Server Alive + periodic D: snapshot"
+        shell: powershell
+        run: |
+          $7z    = "C:\Program Files\7-Zip\7z.exe"
+          $total = [int]$env:KEEPALIVE_MINUTES
+          $every = [int]$env:SNAPSHOT_EVERY_MIN
+          New-Item -ItemType Directory -Force -Path "$env:BACKUP_DIR" | Out-Null
+          for ($i = 1; $i -le $total; $i++) {
+            Start-Sleep -Seconds 60
+            if ($i % $every -eq 0 -or $i -eq $total) {
+              $tmp = "$env:BACKUP_DIR\dstate.tmp.7z"
+              Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+              # -mx=1 fast compression, -ssw include files in use (GFN running)
+              & $7z a -t7z -mx=1 -ssw -bso0 -bsp0 $tmp "$env:PERSIST_DIR" `
+                    "-xr!*.log" "-xr!Crashpad" "-xr!Cache" "-xr!logs" 2>$null
+              if (Test-Path $tmp) {
+                Move-Item $tmp "$env:BACKUP_FILE" -Force
+                $mb = [math]::Round((Get-Item "$env:BACKUP_FILE").Length/1MB,1)
+                Write-Host "[$i/$total] snapshot updated ($mb MB)" -ForegroundColor DarkCyan
+              }
+            } else {
+              Write-Host "[$i/$total] Server running..."
+            }
+          }
+
+      # ---------------------------------------------------------------
+      #  SAVE the D: state for the next session. always() => also runs
+      #  when the job is cancelled or fails.
+      # ---------------------------------------------------------------
+      - name: "8. Save D: drive backup for next session"
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: D:\_backup\dstate.7z
+          key: dstate-${{ github.run_id }}-${{ github.run_attempt }}
