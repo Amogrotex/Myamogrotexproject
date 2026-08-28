@@ -37,10 +37,13 @@ env:
   # (see https://tailscale.com/blog/choose-your-ip). Pick something that
   # nothing else uses, e.g. 100.64.0.50.
   TAILSCALE_STATIC_IP: 100.64.0.50
+  GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Use GitHub's current Windows Server 2025 hosted image.
+    # This keeps Windows itself on C: and uses the newest supported runner image.
+    runs-on: windows-2025
     timeout-minutes: 355
 
     steps:
@@ -64,6 +67,7 @@ jobs:
         run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
           New-LocalUser -Name "CynetAdmin" -Password $Password -PasswordNeverExpires -ErrorAction SilentlyContinue
+          Set-LocalUser -Name "CynetAdmin" -Password $Password -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
       # ---------------------------------------------------------------
@@ -244,25 +248,14 @@ jobs:
           )
           New-Item -ItemType Directory -Force -Path $folders | Out-Null
 
-          # Direct temporary files and common user data to the persistent D: drive.
-          [Environment]::SetEnvironmentVariable("TEMP", "D:\Persist\Temp", "Machine")
-          [Environment]::SetEnvironmentVariable("TMP", "D:\Persist\Temp", "Machine")
-          $env:TEMP = "D:\Persist\Temp"
-          $env:TMP  = "D:\Persist\Temp"
-
-          # Set default locations used by supported Windows/Store applications.
-          $storageKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy"
-          New-Item -Path $storageKey -Force | Out-Null
-          New-ItemProperty -Path $storageKey -Name "01" -PropertyType DWord -Value 1 -Force | Out-Null
-
-          # Give installers a consistent destination. Individual installers may still
-          # require C: for system components or drivers.
-          [Environment]::SetEnvironmentVariable("APP_INSTALL_ROOT", "D:\Apps", "Machine")
-          $env:APP_INSTALL_ROOT = "D:\Apps"
-
-          Write-Host "Applications should be installed under D:\Apps."
-          Write-Host "Persistent user data: D:\Persist"
-          Write-Host "TEMP/TMP: D:\Persist\Temp"
+          # Do not change TEMP, TMP, APPDATA, LOCALAPPDATA, USERPROFILE,
+          # ProgramFiles, or Windows storage policies. Windows services,
+          # Microsoft Store, and AppX packages must continue using C:.
+          # Applications that support custom locations can be installed manually
+          # under D:\Apps.
+          Write-Host "Windows and Microsoft Store remain on C:."
+          Write-Host "Custom application location: D:\Apps"
+          Write-Host "Persistent data location: D:\Persist"
 
       - name: 6. Install Python & Java (Adoptium Temurin 21)
         run: |
