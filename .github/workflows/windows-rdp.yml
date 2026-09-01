@@ -1,6 +1,6 @@
 # =====================================================================
 # Windows Cloud RDP
-# Optimized RDP + Tailscale + Python 3.12 + Java 21
+# RDP + Tailscale + Python 3.12 + Java 21
 # =====================================================================
 
 name: Windows Cloud RDP
@@ -21,227 +21,260 @@ jobs:
       # ===============================================================
       # 1. RDP + PERFORMANCE + PYTHON + JAVA
       # ===============================================================
-      - name: 1. Configure Fast RDP and Install Toolchains
+      - name: 1. Configure RDP and Install Python + Java
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
           Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host " WINDOWS RDP PERFORMANCE SETUP" -ForegroundColor Cyan
+          Write-Host " STEP 1 - RDP + PYTHON + JAVA" -ForegroundColor Cyan
           Write-Host "==================================================" -ForegroundColor Cyan
 
           # -----------------------------------------------------------
-          # Enable Remote Desktop
+          # Enable RDP
           # -----------------------------------------------------------
-          Set-ItemProperty `
-            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
-            -Name "fDenyTSConnections" `
-            -Value 0
+          try {
+              Set-ItemProperty `
+                -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+                -Name "fDenyTSConnections" `
+                -Value 0
 
+              Write-Host "RDP enabled." -ForegroundColor Green
+          }
+          catch {
+              Write-Host "RDP registry configuration warning: $($_.Exception.Message)" -ForegroundColor Yellow
+          }
+
+          # -----------------------------------------------------------
+          # RDP configuration
+          # -----------------------------------------------------------
           $rdp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
-
-          # Keep your original NLA setting
-          Set-ItemProperty `
-            -Path $rdp `
-            -Name "UserAuthentication" `
-            -Value 0
-
-          # -----------------------------------------------------------
-          # RDP transport / performance
-          # -----------------------------------------------------------
           $policy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
 
-          New-Item `
-            -Path $policy `
-            -Force | Out-Null
+          New-Item -Path $policy -Force | Out-Null
 
-          # 2 = allow UDP or TCP
-          # Lets RDP use UDP when available.
-          Set-ItemProperty `
-            -Path $policy `
-            -Name "SelectTransport" `
-            -Type DWord `
-            -Value 2 `
-            -Force
+          # Allow UDP or TCP.
+          # RDP can use UDP when available and fall back to TCP.
+          try {
+              Set-ItemProperty `
+                -Path $policy `
+                -Name "SelectTransport" `
+                -Type DWord `
+                -Value 2 `
+                -Force
 
-          # Enable RDP compression
-          Set-ItemProperty `
-            -Path $policy `
-            -Name "fCompressionEnabled" `
-            -Type DWord `
-            -Value 1 `
-            -Force
+              Set-ItemProperty `
+                -Path $policy `
+                -Name "fCompressionEnabled" `
+                -Type DWord `
+                -Value 1 `
+                -Force
 
-          # Lower graphical bandwidth
-          Set-ItemProperty `
-            -Path $policy `
-            -Name "ColorDepth" `
-            -Type DWord `
-            -Value 2 `
-            -Force
+              Set-ItemProperty `
+                -Path $policy `
+                -Name "ColorDepth" `
+                -Type DWord `
+                -Value 2 `
+                -Force
+          }
+          catch {
+              Write-Host "RDP policy warning: $($_.Exception.Message)" -ForegroundColor Yellow
+          }
 
-          # -----------------------------------------------------------
-          # Disable expensive visual effects
-          # -----------------------------------------------------------
-          Set-ItemProperty `
-            -Path $rdp `
-            -Name "fDisableWallpaper" `
-            -Value 1 `
-            -ErrorAction SilentlyContinue
-
-          Set-ItemProperty `
-            -Path $rdp `
-            -Name "fDisableFullWindowDrag" `
-            -Value 1 `
-            -ErrorAction SilentlyContinue
-
-          Set-ItemProperty `
-            -Path $rdp `
-            -Name "fDisableMenuAnims" `
-            -Value 1 `
-            -ErrorAction SilentlyContinue
-
-          Set-ItemProperty `
-            -Path $rdp `
-            -Name "fDisableThemes" `
-            -Value 1 `
-            -ErrorAction SilentlyContinue
+          # Keep your original NLA configuration.
+          try {
+              Set-ItemProperty `
+                -Path $rdp `
+                -Name "UserAuthentication" `
+                -Value 0
+          }
+          catch {
+              Write-Host "NLA registry warning." -ForegroundColor Yellow
+          }
 
           # -----------------------------------------------------------
-          # Disable unnecessary RDP redirection
+          # Reduce RDP graphical overhead
           # -----------------------------------------------------------
-          Set-ItemProperty `
-            -Path $policy `
-            -Name "fDisableAudioCapture" `
-            -Type DWord `
-            -Value 1 `
-            -Force
+          $visual = @(
+              "fDisableWallpaper",
+              "fDisableFullWindowDrag",
+              "fDisableMenuAnims",
+              "fDisableThemes"
+          )
 
-          Set-ItemProperty `
-            -Path $policy `
-            -Name "fDisableCdm" `
-            -Type DWord `
-            -Value 1 `
-            -Force
-
-          # -----------------------------------------------------------
-          # High Performance power plan
-          # -----------------------------------------------------------
-          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-
-          # Prevent idle power saving while the job is alive
-          powercfg /change monitor-timeout-ac 0
-          powercfg /change standby-timeout-ac 0
-          powercfg /change hibernate-timeout-ac 0
+          foreach ($name in $visual) {
+              try {
+                  Set-ItemProperty `
+                    -Path $rdp `
+                    -Name $name `
+                    -Value 1 `
+                    -ErrorAction SilentlyContinue
+              }
+              catch {}
+          }
 
           # -----------------------------------------------------------
-          # Firewall
+          # Disable unnecessary redirection
           # -----------------------------------------------------------
-          Enable-NetFirewallRule `
-            -DisplayGroup "Remote Desktop" `
-            -ErrorAction SilentlyContinue
+          try {
+              Set-ItemProperty `
+                -Path $policy `
+                -Name "fDisableAudioCapture" `
+                -Type DWord `
+                -Value 1 `
+                -Force
 
-          # TCP 3389
-          Remove-NetFirewallRule `
-            -DisplayName "Optimized RDP TCP" `
-            -ErrorAction SilentlyContinue
+              Set-ItemProperty `
+                -Path $policy `
+                -Name "fDisableCdm" `
+                -Type DWord `
+                -Value 1 `
+                -Force
+          }
+          catch {}
 
-          New-NetFirewallRule `
-            -DisplayName "Optimized RDP TCP" `
-            -Direction Inbound `
-            -Protocol TCP `
-            -LocalPort 3389 `
-            -Action Allow `
-            -Profile Any
+          # -----------------------------------------------------------
+          # High performance
+          # -----------------------------------------------------------
+          try {
+              powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+              powercfg /change monitor-timeout-ac 0
+              powercfg /change standby-timeout-ac 0
+              powercfg /change hibernate-timeout-ac 0
+          }
+          catch {
+              Write-Host "Power configuration warning." -ForegroundColor Yellow
+          }
 
-          # UDP 3389
-          Remove-NetFirewallRule `
-            -DisplayName "Optimized RDP UDP" `
-            -ErrorAction SilentlyContinue
+          # -----------------------------------------------------------
+          # RDP firewall
+          # -----------------------------------------------------------
+          try {
+              Enable-NetFirewallRule `
+                -DisplayGroup "Remote Desktop" `
+                -ErrorAction SilentlyContinue
 
-          New-NetFirewallRule `
-            -DisplayName "Optimized RDP UDP" `
-            -Direction Inbound `
-            -Protocol UDP `
-            -LocalPort 3389 `
-            -Action Allow `
-            -Profile Any
+              Remove-NetFirewallRule `
+                -DisplayName "Cloud RDP TCP 3389" `
+                -ErrorAction SilentlyContinue
+
+              New-NetFirewallRule `
+                -DisplayName "Cloud RDP TCP 3389" `
+                -Direction Inbound `
+                -Protocol TCP `
+                -LocalPort 3389 `
+                -Action Allow `
+                -Profile Any `
+                -ErrorAction SilentlyContinue
+
+              Remove-NetFirewallRule `
+                -DisplayName "Cloud RDP UDP 3389" `
+                -ErrorAction SilentlyContinue
+
+              New-NetFirewallRule `
+                -DisplayName "Cloud RDP UDP 3389" `
+                -Direction Inbound `
+                -Protocol UDP `
+                -LocalPort 3389 `
+                -Action Allow `
+                -Profile Any `
+                -ErrorAction SilentlyContinue
+
+              Write-Host "RDP firewall configured." -ForegroundColor Green
+          }
+          catch {
+              Write-Host "Firewall warning: $($_.Exception.Message)" -ForegroundColor Yellow
+          }
 
           # -----------------------------------------------------------
           # RDP service
           # -----------------------------------------------------------
-          Set-Service `
-            -Name "TermService" `
-            -StartupType Automatic
+          try {
+              Set-Service `
+                -Name "TermService" `
+                -StartupType Automatic `
+                -ErrorAction SilentlyContinue
 
-          Restart-Service `
-            -Name "TermService" `
-            -Force
-
-          Start-Sleep -Seconds 2
-
-          Write-Host ">>> RDP configured." -ForegroundColor Green
+              Start-Service `
+                -Name "TermService" `
+                -ErrorAction SilentlyContinue
+          }
+          catch {
+              Write-Host "RDP service warning." -ForegroundColor Yellow
+          }
 
           # ===========================================================
           # PYTHON
           # ===========================================================
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host " INSTALLING PYTHON 3.12" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host ""
+          Write-Host ">>> Installing Python 3.12..." -ForegroundColor Cyan
 
           $pythonInstaller = "C:\python-installer.exe"
 
-          Invoke-WebRequest `
-            "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" `
-            -OutFile $pythonInstaller
+          try {
+              Invoke-WebRequest `
+                "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" `
+                -OutFile $pythonInstaller `
+                -UseBasicParsing
 
-          Start-Process `
-            $pythonInstaller `
-            -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" `
-            -Wait
+              Start-Process `
+                $pythonInstaller `
+                -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" `
+                -Wait
 
-          Remove-Item `
-            $pythonInstaller `
-            -Force `
-            -ErrorAction SilentlyContinue
+              Remove-Item `
+                $pythonInstaller `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              Write-Host "Python installed." -ForegroundColor Green
+          }
+          catch {
+              Write-Host "Python installation failed: $($_.Exception.Message)" -ForegroundColor Red
+              throw
+          }
 
           # ===========================================================
           # JAVA 21
           # ===========================================================
-          Write-Host "==================================================" -ForegroundColor Cyan
-          Write-Host " INSTALLING JAVA 21" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host ""
+          Write-Host ">>> Installing Eclipse Temurin Java 21..." -ForegroundColor Cyan
 
           $jdk = "C:\jdk.msi"
 
-          Invoke-WebRequest `
-            "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" `
-            -OutFile $jdk
+          try {
+              Invoke-WebRequest `
+                "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" `
+                -OutFile $jdk `
+                -UseBasicParsing
 
-          Start-Process `
-            msiexec.exe `
-            -ArgumentList "/i `"$jdk`" /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart" `
-            -Wait
+              Start-Process `
+                msiexec.exe `
+                -ArgumentList "/i `"$jdk`" /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart" `
+                -Wait
 
-          Remove-Item `
-            $jdk `
-            -Force `
-            -ErrorAction SilentlyContinue
+              Remove-Item `
+                $jdk `
+                -Force `
+                -ErrorAction SilentlyContinue
 
-          # Refresh PATH for this job
-          $env:Path =
-            [Environment]::GetEnvironmentVariable("Path","Machine") +
-            ";" +
-            [Environment]::GetEnvironmentVariable("Path","User")
+              Write-Host "Java installed." -ForegroundColor Green
+          }
+          catch {
+              Write-Host "Java installation failed: $($_.Exception.Message)" -ForegroundColor Red
+              throw
+          }
+
+          # Refresh environment
+          $machinePath = [Environment]::GetEnvironmentVariable("Path","Machine")
+          $userPath = [Environment]::GetEnvironmentVariable("Path","User")
+
+          $env:Path = "$machinePath;$userPath"
 
           Write-Host ""
-          Write-Host ">>> TOOLCHAINS INSTALLED" -ForegroundColor Green
-          Write-Host "Python:" -ForegroundColor Yellow
-          python --version
-
-          Write-Host "Java:" -ForegroundColor Yellow
-          java -version
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host " STEP 1 COMPLETE" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
 
 
       # ===============================================================
@@ -252,7 +285,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # Keep hardcoded password exactly as requested
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host " STEP 2 - RDP USERS" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+
+          # Keep hardcoded password exactly as requested.
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
 
           # -----------------------------------------------------------
@@ -264,18 +301,18 @@ jobs:
 
           if (-not $user) {
 
-            New-LocalUser `
-              -Name "CynetAdmin" `
-              -Password $Password `
-              -PasswordNeverExpires `
-              -AccountNeverExpires
+              New-LocalUser `
+                -Name "CynetAdmin" `
+                -Password $Password `
+                -PasswordNeverExpires `
+                -AccountNeverExpires
 
           }
           else {
 
-            Set-LocalUser `
-              -Name "CynetAdmin" `
-              -Password $Password
+              Set-LocalUser `
+                -Name "CynetAdmin" `
+                -Password $Password
 
           }
 
@@ -305,8 +342,191 @@ jobs:
             -Member "runneradmin" `
             -ErrorAction SilentlyContinue
 
-          Write-Host ">>> RDP users configured." -ForegroundColor Green
+          Write-Host ""
+          Write-Host "RDP USERS READY" -ForegroundColor Green
+          Write-Host "Username : runneradmin" -ForegroundColor Yellow
+          Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host " STEP 2 COMPLETE" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
 
 
       # ===============================================================
-      # 3.
+      # 3. TAILSCALE
+      # ===============================================================
+      - name: 3. Install and Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host " STEP 3 - TAILSCALE" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+
+          $msi = "C:\tailscale.msi"
+
+          # -----------------------------------------------------------
+          # Download
+          # -----------------------------------------------------------
+          if (-not (Test-Path $msi)) {
+
+              curl.exe `
+                -L `
+                --retry 5 `
+                --retry-delay 2 `
+                --connect-timeout 20 `
+                -o $msi `
+                "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          }
+
+          if (-not (Test-Path $msi)) {
+              throw "Could not download Tailscale."
+          }
+
+          # -----------------------------------------------------------
+          # Install
+          # -----------------------------------------------------------
+          Start-Process `
+            msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart TS_NOLAUNCH=1" `
+            -Wait
+
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+              throw "Tailscale executable not found after installation."
+          }
+
+          # -----------------------------------------------------------
+          # Make sure Tailscale service is running
+          # -----------------------------------------------------------
+          try {
+              Start-Service `
+                -Name "Tailscale" `
+                -ErrorAction SilentlyContinue
+          }
+          catch {}
+
+          Start-Sleep -Seconds 2
+
+          # -----------------------------------------------------------
+          # Connect
+          # -----------------------------------------------------------
+          & $ts up `
+            --authkey="$env:TAILSCALE_AUTHKEY" `
+            --hostname="github-rdp-server" `
+            --reset `
+            --ssh=false `
+            --accept-dns=false `
+            --unattended=true
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale connection failed. Exit code: $LASTEXITCODE"
+          }
+
+          # -----------------------------------------------------------
+          # Wait for the Tailscale IPv4 address
+          # -----------------------------------------------------------
+          $tsIp = $null
+
+          for ($i = 1; $i -le 40; $i++) {
+
+              $candidate = (
+                & $ts ip -4 2>$null |
+                Select-Object -First 1
+              )
+
+              if ($candidate) {
+
+                  $candidate = ([string]$candidate).Trim()
+
+                  if ($candidate -match "^100\.") {
+                      $tsIp = $candidate
+                      break
+                  }
+
+              }
+
+              Start-Sleep -Seconds 1
+          }
+
+          if (-not $tsIp) {
+              throw "Tailscale connected but no IPv4 address was returned."
+          }
+
+          # -----------------------------------------------------------
+          # Connection information
+          # -----------------------------------------------------------
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host " TAILSCALE CONNECTED" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "Tailscale IP : $tsIp" -ForegroundColor Yellow
+          Write-Host "RDP Port     : 3389" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "RDP COMMAND:" -ForegroundColor Cyan
+          Write-Host "mstsc /v:$tsIp" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
+
+
+      # ===============================================================
+      # 4. CONNECTION INFORMATION
+      # ===============================================================
+      - name: 4. Show Connection Information
+        shell: powershell
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $ip = (
+            & $ts ip -4 2>$null |
+            Select-Object -First 1
+          )
+
+          $ip = ([string]$ip).Trim()
+
+          Write-Host ""
+          Write-Host "##################################################" -ForegroundColor Green
+          Write-Host "#                                                #" -ForegroundColor Green
+          Write-Host "#              WINDOWS RDP ONLINE                #" -ForegroundColor Green
+          Write-Host "#                                                #" -ForegroundColor Green
+          Write-Host "##################################################" -ForegroundColor Green
+          Write-Host "#                                                #" -ForegroundColor Green
+          Write-Host "# Tailscale IP : $ip" -ForegroundColor Yellow
+          Write-Host "# RDP Port     : 3389" -ForegroundColor Yellow
+          Write-Host "# Username     : runneradmin" -ForegroundColor Yellow
+          Write-Host "# Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "#                                                #" -ForegroundColor Green
+          Write-Host "# Connect with:                                  #" -ForegroundColor Cyan
+          Write-Host "# mstsc /v:$ip" -ForegroundColor Magenta
+          Write-Host "#                                                #" -ForegroundColor Green
+          Write-Host "##################################################" -ForegroundColor Green
+
+
+      # ===============================================================
+      # 5. KEEP ALIVE
+      # ===============================================================
+      - name: 5. Keep Server Alive
+        shell: powershell
+        run: |
+          $total = [int]$env:KEEPALIVE_MINUTES
+
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host " SERVER RUNNING" -ForegroundColor Green
+          Write-Host " KEEP ALIVE: $total MINUTES" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+
+          for ($i = 1; $i -le $total; $i++) {
+
+              Start-Sleep -Seconds 60
+
+              if (($i % 5) -eq 0) {
+                  Write-Host "[$i/$total] Server running..." -ForegroundColor Green
+              }
+          }
