@@ -1,6 +1,9 @@
 # =====================================================================
-# Windows Cloud RDP (Tailscale + Python + Java)
+# WINDOWS CLOUD RDP
+# Fast RDP + Tailscale direct-connect optimization
+# Python 3.12 + Java 21
 # =====================================================================
+
 name: Windows Cloud RDP
 
 on:
@@ -16,85 +19,188 @@ jobs:
 
     steps:
 
-      # ---------------------------------------------------------------
-      # 1. Enable RDP correctly
-      # ---------------------------------------------------------------
-      - name: 1. Enable RDP
+      # ===============================================================
+      # 1. WINDOWS / RDP PERFORMANCE
+      # ===============================================================
+      - name: 1. Configure High Performance RDP
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Write-Host ">>> Enabling Remote Desktop..." -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host " WINDOWS RDP PERFORMANCE SETUP" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
 
+          # -----------------------------------------------------------
           # Enable RDP
+          # -----------------------------------------------------------
           Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
             -Value 0
 
-          # Allow RDP through Windows Firewall
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          $rdp = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
 
-          # Explicit TCP 3389 rule
-          if (-not (Get-NetFirewallRule -DisplayName "Tailscale RDP 3389" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule `
-              -DisplayName "Tailscale RDP 3389" `
-              -Direction Inbound `
-              -Protocol TCP `
-              -LocalPort 3389 `
-              -Action Allow `
-              -Profile Any
-          }
-
-          # Explicit UDP 3389 rule
-          if (-not (Get-NetFirewallRule -DisplayName "Tailscale RDP UDP 3389" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule `
-              -DisplayName "Tailscale RDP UDP 3389" `
-              -Direction Inbound `
-              -Protocol UDP `
-              -LocalPort 3389 `
-              -Action Allow `
-              -Profile Any
-          }
-
-          # Keep NLA disabled as in your original workflow
-          $rdpPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-
+          # Keep your original behavior
           Set-ItemProperty `
-            -Path $rdpPath `
-            -Name 'UserAuthentication' `
+            -Path $rdp `
+            -Name "UserAuthentication" `
             -Value 0
 
+          # -----------------------------------------------------------
+          # Allow UDP + TCP transport
+          # -----------------------------------------------------------
+          $policy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          New-Item `
+            -Path $policy `
+            -Force | Out-Null
+
+          # 2 = UDP or TCP
           Set-ItemProperty `
-            -Path $rdpPath `
-            -Name 'fInheritMaxIdleTime' `
-            -Value 1
+            -Path $policy `
+            -Name "SelectTransport" `
+            -Type DWord `
+            -Value 2 `
+            -Force
 
-          # Make sure the RDP service is running
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          # Compression
+          Set-ItemProperty `
+            -Path $policy `
+            -Name "fCompressionEnabled" `
+            -Type DWord `
+            -Value 1 `
+            -Force
 
-          # Restart service so registry changes are applied
-          Restart-Service -Name TermService -Force
+          # Lower bandwidth usage
+          Set-ItemProperty `
+            -Path $policy `
+            -Name "ColorDepth" `
+            -Type DWord `
+            -Value 2 `
+            -Force
+
+          # -----------------------------------------------------------
+          # Disable expensive graphical effects
+          # -----------------------------------------------------------
+          $visualPolicies = @{
+            "fDisableWallpaper"    = 1
+            "fDisableFullWindowDrag" = 1
+            "fDisableMenuAnims"    = 1
+            "fDisableThemes"       = 1
+          }
+
+          foreach ($item in $visualPolicies.GetEnumerator()) {
+            Set-ItemProperty `
+              -Path $rdp `
+              -Name $item.Key `
+              -Value $item.Value `
+              -ErrorAction SilentlyContinue
+          }
+
+          # -----------------------------------------------------------
+          # Disable unnecessary redirection
+          # -----------------------------------------------------------
+          Set-ItemProperty `
+            -Path $policy `
+            -Name "fDisableAudioCapture" `
+            -Type DWord `
+            -Value 1 `
+            -Force
+
+          Set-ItemProperty `
+            -Path $policy `
+            -Name "fDisableCdm" `
+            -Type DWord `
+            -Value 1 `
+            -Force
+
+          # -----------------------------------------------------------
+          # Windows performance
+          # -----------------------------------------------------------
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+
+          # -----------------------------------------------------------
+          # Firewall
+          # -----------------------------------------------------------
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          # RDP TCP
+          Remove-NetFirewallRule `
+            -DisplayName "Optimized RDP TCP" `
+            -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "Optimized RDP TCP" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -Profile Any
+
+          # RDP UDP
+          Remove-NetFirewallRule `
+            -DisplayName "Optimized RDP UDP" `
+            -ErrorAction SilentlyContinue
+
+          New-NetFirewallRule `
+            -DisplayName "Optimized RDP UDP" `
+            -Direction Inbound `
+            -Protocol UDP `
+            -LocalPort 3389 `
+            -Action Allow `
+            -Profile Any
+
+          # -----------------------------------------------------------
+          # Ensure RDP service
+          # -----------------------------------------------------------
+          Set-Service `
+            -Name "TermService" `
+            -StartupType Automatic
+
+          Restart-Service `
+            -Name "TermService" `
+            -Force
+
           Start-Sleep -Seconds 3
 
-          Write-Host ">>> RDP service status:" -ForegroundColor Green
-          Get-Service TermService | Format-Table Name, Status, StartType
+          $service = Get-Service TermService
 
-          Write-Host ">>> RDP listeners:" -ForegroundColor Green
-          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          Write-Host ""
+          Write-Host "TermService: $($service.Status)" -ForegroundColor Green
 
-      # ---------------------------------------------------------------
-      # 2. Create RDP user
-      # ---------------------------------------------------------------
-      - name: 2. Create Admin Account
+          $listener = Get-NetTCPConnection `
+            -LocalPort 3389 `
+            -State Listen `
+            -ErrorAction SilentlyContinue
+
+          if (-not $listener) {
+            throw "RDP TCP 3389 is not listening."
+          }
+
+          Write-Host "RDP TCP 3389: LISTENING" -ForegroundColor Green
+
+
+      # ===============================================================
+      # 2. USERS
+      # ===============================================================
+      - name: 2. Configure RDP Users
         shell: powershell
         run: |
           $Password = ConvertTo-SecureString "Cynet@2026" -AsPlainText -Force
 
-          Write-Host ">>> Creating / updating CynetAdmin..." -ForegroundColor Cyan
-
-          $user = Get-LocalUser -Name "CynetAdmin" -ErrorAction SilentlyContinue
+          # -----------------------------------------------------------
+          # CynetAdmin
+          # -----------------------------------------------------------
+          $user = Get-LocalUser `
+            -Name "CynetAdmin" `
+            -ErrorAction SilentlyContinue
 
           if (-not $user) {
             New-LocalUser `
@@ -119,9 +225,11 @@ jobs:
             -Member "CynetAdmin" `
             -ErrorAction SilentlyContinue
 
-          # GitHub runner account
-          net user runneradmin "Cynet@2026"
-          net user runneradmin /active:yes
+
+          # -----------------------------------------------------------
+          # runneradmin
+          # -----------------------------------------------------------
+          net user runneradmin "Cynet@2026" /active:yes
 
           Add-LocalGroupMember `
             -Group "Administrators" `
@@ -133,12 +241,16 @@ jobs:
             -Member "runneradmin" `
             -ErrorAction SilentlyContinue
 
-          Write-Host ">>> Users configured." -ForegroundColor Green
+          Write-Host ""
+          Write-Host "RDP USER READY" -ForegroundColor Green
+          Write-Host "Username : runneradmin" -ForegroundColor Yellow
+          Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
 
-      # ---------------------------------------------------------------
-      # 3. Install Tailscale
-      # ---------------------------------------------------------------
-      - name: 3. Install & Connect Tailscale
+
+      # ===============================================================
+      # 3. TAILSCALE
+      # ===============================================================
+      - name: 3. Install and Optimize Tailscale
         shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
@@ -146,33 +258,36 @@ jobs:
           $ErrorActionPreference = "Stop"
           $ProgressPreference = "SilentlyContinue"
 
-          Write-Host ">>> Downloading Tailscale..." -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host " TAILSCALE SETUP" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
 
-          if (-not (Test-Path "C:\tailscale.msi")) {
+          $msi = "C:\tailscale.msi"
+
+          if (-not (Test-Path $msi)) {
             curl.exe `
               -L `
               --retry 5 `
               --retry-delay 2 `
-              -o "C:\tailscale.msi" `
+              --connect-timeout 15 `
+              -o $msi `
               "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           }
 
-          Write-Host ">>> Installing Tailscale..." -ForegroundColor Cyan
-
           Start-Process `
             msiexec.exe `
-            -ArgumentList "/i C:\tailscale.msi /quiet /norestart" `
+            -ArgumentList "/i `"$msi`" /quiet /norestart" `
             -Wait
 
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
 
           if (-not (Test-Path $ts)) {
-            throw "Tailscale executable was not installed."
+            throw "Tailscale installation failed."
           }
 
-          # Make Tailscale run independently of interactive login
-          Write-Host ">>> Enabling unattended mode..." -ForegroundColor Cyan
-
+          # -----------------------------------------------------------
+          # Connect + unattended
+          # -----------------------------------------------------------
           & $ts up `
             --authkey="$env:TAILSCALE_AUTHKEY" `
             --hostname="github-rdp-server" `
@@ -182,21 +297,28 @@ jobs:
             --unattended=true
 
           if ($LASTEXITCODE -ne 0) {
-            throw "tailscale up failed with exit code $LASTEXITCODE"
+            throw "tailscale up failed: $LASTEXITCODE"
           }
 
           Start-Sleep -Seconds 5
 
-          # Get IPv4
-          $ts_ip = $null
+          # -----------------------------------------------------------
+          # Get Tailscale IP
+          # -----------------------------------------------------------
+          $tsIp = $null
 
           for ($i = 1; $i -le 30; $i++) {
-            $raw = (& $ts ip -4 2>$null | Select-Object -First 1)
 
-            if ($raw) {
-              $ts_ip = ([string]$raw).Trim()
+            $candidate = (
+              & $ts ip -4 2>$null |
+              Select-Object -First 1
+            )
 
-              if ($ts_ip -match '^100\.') {
+            if ($candidate) {
+              $candidate = ([string]$candidate).Trim()
+
+              if ($candidate -match "^100\.") {
+                $tsIp = $candidate
                 break
               }
             }
@@ -204,130 +326,235 @@ jobs:
             Start-Sleep -Seconds 1
           }
 
-          if (-not $ts_ip) {
-            throw "Could not obtain Tailscale IPv4 address."
+          if (-not $tsIp) {
+            throw "Tailscale did not provide an IPv4 address."
           }
 
+          # -----------------------------------------------------------
+          # Important: inspect NAT / UDP state
+          # -----------------------------------------------------------
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "       WINDOWS RDP SERVER READY" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "RDP Port     : 3389" -ForegroundColor Yellow
-          Write-Host "Username     : runneradmin" -ForegroundColor Yellow
-          Write-Host "Alt Username : CynetAdmin" -ForegroundColor Yellow
-          Write-Host "Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host ""
-          Write-Host "Connect using:" -ForegroundColor Magenta
-          Write-Host "mstsc /v:$ts_ip" -ForegroundColor Magenta
+          Write-Host " TAILSCALE NETCHECK" -ForegroundColor Green
           Write-Host "==================================================" -ForegroundColor Green
 
-          # Show Tailscale status
+          & $ts netcheck
+
+          # -----------------------------------------------------------
+          # Verify local Tailscale UDP port
+          # -----------------------------------------------------------
           Write-Host ""
-          Write-Host ">>> Tailscale status:" -ForegroundColor Cyan
-          & $ts status
+          Write-Host ">>> UDP 41641 check" -ForegroundColor Cyan
 
-      # ---------------------------------------------------------------
-      # 4. Verify RDP locally
-      # ---------------------------------------------------------------
-      - name: 4. Verify RDP
-        shell: powershell
-        run: |
-          Write-Host ">>> Checking TermService..." -ForegroundColor Cyan
-          $svc = Get-Service TermService
-          $svc | Format-List Name, Status, StartType
-
-          if ($svc.Status -ne "Running") {
-            throw "Remote Desktop service is not running."
-          }
-
-          Write-Host ">>> Checking TCP 3389..." -ForegroundColor Cyan
-
-          $listener = Get-NetTCPConnection `
-            -LocalPort 3389 `
-            -State Listen `
+          $udp41641 = Get-NetUDPEndpoint `
+            -LocalPort 41641 `
             -ErrorAction SilentlyContinue
 
-          if (-not $listener) {
-            throw "Nothing is listening on TCP 3389."
+          if ($udp41641) {
+            Write-Host "UDP 41641 is active." -ForegroundColor Green
+          }
+          else {
+            Write-Host "UDP 41641 listener not visible; Tailscale may still work through NAT." -ForegroundColor Yellow
           }
 
-          $listener | Format-Table LocalAddress, LocalPort, State, OwningProcess
+          # -----------------------------------------------------------
+          # Output
+          # -----------------------------------------------------------
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host " TAILSCALE CONNECTED" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host "IP       : $tsIp" -ForegroundColor Yellow
+          Write-Host "RDP      : 3389" -ForegroundColor Yellow
+          Write-Host "Username : runneradmin" -ForegroundColor Yellow
+          Write-Host "Password : Cynet@2026" -ForegroundColor Yellow
+          Write-Host ""
+          Write-Host "RDP:"
+          Write-Host "mstsc /v:$tsIp" -ForegroundColor Magenta
+          Write-Host "==================================================" -ForegroundColor Green
 
-          Write-Host ">>> Testing local RDP port..." -ForegroundColor Cyan
 
-          $test = Test-NetConnection `
-            -ComputerName "127.0.0.1" `
+      # ===============================================================
+      # 4. CONNECTION TEST
+      # ===============================================================
+      - name: 4. Test RDP and Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $tsIp = (
+            & $ts ip -4 2>$null |
+            Select-Object -First 1
+          )
+
+          $tsIp = ([string]$tsIp).Trim()
+
+          Write-Host "==================================================" -ForegroundColor Cyan
+          Write-Host " CONNECTION DIAGNOSTICS" -ForegroundColor Cyan
+          Write-Host "==================================================" -ForegroundColor Cyan
+
+          # -----------------------------------------------------------
+          # Local RDP
+          # -----------------------------------------------------------
+          $tcp = Test-NetConnection `
+            127.0.0.1 `
             -Port 3389 `
             -WarningAction SilentlyContinue
 
-          if (-not $test.TcpTestSucceeded) {
-            throw "TCP 3389 local test failed."
+          if (-not $tcp.TcpTestSucceeded) {
+            throw "Local RDP TCP 3389 test failed."
           }
 
-          Write-Host ">>> TCP 3389 is OPEN." -ForegroundColor Green
+          Write-Host "Local RDP : OK" -ForegroundColor Green
 
+          # -----------------------------------------------------------
+          # Tailscale status
+          # -----------------------------------------------------------
           Write-Host ""
-          Write-Host ">>> Network adapters:" -ForegroundColor Cyan
+          Write-Host ">>> Tailscale status" -ForegroundColor Cyan
+          & $ts status
+
+          # -----------------------------------------------------------
+          # Self ping
+          # -----------------------------------------------------------
+          Write-Host ""
+          Write-Host ">>> Tailscale self ping" -ForegroundColor Cyan
+          & $ts ping $tsIp --c=3 2>&1
+
+          # -----------------------------------------------------------
+          # Network information
+          # -----------------------------------------------------------
+          Write-Host ""
+          Write-Host ">>> Network adapters" -ForegroundColor Cyan
+
           Get-NetAdapter |
             Where-Object {$_.Status -eq "Up"} |
             Format-Table Name, InterfaceDescription, Status, LinkSpeed
 
-      # ---------------------------------------------------------------
-      # 5. Install Python + Java
-      # ---------------------------------------------------------------
-      - name: 5. Install Python & Java
+          Write-Host ""
+          Write-Host "==================================================" -ForegroundColor Green
+          Write-Host " CONNECTION TEST COMPLETE" -ForegroundColor Green
+          Write-Host "==================================================" -ForegroundColor Green
+
+
+      # ===============================================================
+      # 5. PYTHON
+      # ===============================================================
+      - name: 5. Install Python 3.12
         shell: powershell
         run: |
-          $ProgressPreference = 'SilentlyContinue'
+          $ProgressPreference = "SilentlyContinue"
 
-          Write-Host ">>> Installing Python 3.12..." -ForegroundColor Cyan
+          $installer = "C:\python-installer.exe"
 
           Invoke-WebRequest `
             "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" `
-            -OutFile "C:\python-installer.exe"
+            -OutFile $installer
 
           Start-Process `
-            "C:\python-installer.exe" `
+            $installer `
             -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" `
             -Wait
 
-          Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
+          Remove-Item `
+            $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
 
-          Write-Host ">>> Installing Temurin Java 21..." -ForegroundColor Cyan
+          $env:Path =
+            [Environment]::GetEnvironmentVariable("Path","Machine") +
+            ";" +
+            [Environment]::GetEnvironmentVariable("Path","User")
+
+          Write-Host "Python:" -ForegroundColor Green
+          python --version
+
+
+      # ===============================================================
+      # 6. JAVA
+      # ===============================================================
+      - name: 6. Install Java 21
+        shell: powershell
+        run: |
+          $ProgressPreference = "SilentlyContinue"
+
+          $jdk = "C:\jdk.msi"
 
           Invoke-WebRequest `
             "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" `
-            -OutFile "C:\jdk.msi"
+            -OutFile $jdk
 
           Start-Process `
             msiexec.exe `
-            -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' `
+            -ArgumentList "/i `"$jdk`" /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart" `
             -Wait
 
-          Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
+          Remove-Item `
+            $jdk `
+            -Force `
+            -ErrorAction SilentlyContinue
 
-          $env:Path = `
-            [Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
+          $env:Path =
+            [Environment]::GetEnvironmentVariable("Path","Machine") +
+            ";" +
             [Environment]::GetEnvironmentVariable("Path","User")
 
-          Write-Host ""
-          Write-Host "==================================================" -ForegroundColor Green
-          Write-Host "TOOLCHAIN" -ForegroundColor Cyan
-          Write-Host "==================================================" -ForegroundColor Green
-
-          python --version
           java -version
 
-      # ---------------------------------------------------------------
-      # 6. Keep alive
-      # ---------------------------------------------------------------
-      - name: 6. Keep Server Alive
+
+      # ===============================================================
+      # 7. FINAL
+      # ===============================================================
+      - name: 7. Final Connection Information
+        shell: powershell
+        run: |
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+          $ip = (
+            & $ts ip -4 2>$null |
+            Select-Object -First 1
+          )
+
+          $ip = ([string]$ip).Trim()
+
+          Write-Host ""
+          Write-Host "##################################################" -ForegroundColor Green
+          Write-Host "#              RDP SERVER ONLINE                 #" -ForegroundColor Green
+          Write-Host "##################################################" -ForegroundColor Green
+          Write-Host "# Tailscale IP : $ip" -ForegroundColor Yellow
+          Write-Host "# RDP Port     : 3389" -ForegroundColor Yellow
+          Write-Host "# Username     : runneradmin" -ForegroundColor Yellow
+          Write-Host "# Password     : Cynet@2026" -ForegroundColor Yellow
+          Write-Host "#                                                #" -ForegroundColor Green
+          Write-Host "# mstsc /v:$ip" -ForegroundColor Magenta
+          Write-Host "##################################################" -ForegroundColor Green
+
+
+      # ===============================================================
+      # 8. KEEP ALIVE
+      # ===============================================================
+      - name: 8. Keep Server Alive
         shell: powershell
         run: |
           $total = [int]$env:KEEPALIVE_MINUTES
 
           for ($i = 1; $i -le $total; $i++) {
+
             Start-Sleep -Seconds 60
-            Write-Host "[$i/$total] Server running..."
+
+            if (($i % 5) -eq 0) {
+
+              $ts = "C:\Program Files\Tailscale\tailscale.exe"
+
+              $ip = (
+                & $ts ip -4 2>$null |
+                Select-Object -First 1
+              )
+
+              Write-Host `
+                "[$i/$total] ONLINE | Tailscale: $ip" `
+                -ForegroundColor Green
+            }
           }
