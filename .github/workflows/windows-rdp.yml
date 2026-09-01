@@ -1,17 +1,5 @@
 # =====================================================================
-#  Windows Cloud RDP  (Tailscale + persistent D: drive + GeForce NOW)
-# ---------------------------------------------------------------------
-#  NOTE: GitHub-hosted runners are for CI only. Using them as a remote
-#  desktop / gaming box violates the GitHub Actions ToS and can get the
-#  account suspended. Also: runners have NO GPU, so the GeForce NOW
-#  client will very likely refuse to stream (kept here as requested).
-#
-#  STATIC IP CHANGES (see steps 4 & 4b):
-#    - The Windows Tailscale client does NOT support the --ephemeral
-#      flag, so instead step "4b" deletes stale nodes left behind by
-#      previous sessions (via the API) to free the static IP, then pins
-#      TAILSCALE_STATIC_IP onto the fresh node. Every session comes up
-#      on the SAME address.
+#  Windows Cloud RDP  (Tailscale + Python & Java)
 # =====================================================================
 name: Windows Cloud RDP
 
@@ -19,34 +7,19 @@ on:
   workflow_dispatch:
 
 env:
-  # Everything we want to survive between sessions lives here.
-  PERSIST_DIR: D:\Persist
-  # Store the cache archive on C:, which is guaranteed on hosted runners.
-  # D: is reserved for the restored working data.
-  BACKUP_DIR: C:\_backup
-  BACKUP_FILE: C:\_backup\dstate.7z
-  # How often (in minutes) the live snapshot of D:\Persist is refreshed.
-  SNAPSHOT_EVERY_MIN: 15
-  # Keep-alive length. Hosted jobs are hard-killed at 6 h, so we stop a
-  # bit earlier and exit cleanly => the backup step always completes.
+  # Keep-alive length in minutes (GitHub hosted runners have a 6-hour hard limit).
   KEEPALIVE_MINUTES: 340
   # >>> STATIC TAILSCALE IP <<<
-  # This MUST be inside your tailnet's IP range (admin console ->
-  # Settings -> Keys / IP range). The default pool is 100.64.0.0/10, and
-  # you can only pin addresses the control server has allocated to you
-  # (see https://tailscale.com/blog/choose-your-ip). Pick something that
-  # nothing else uses, e.g. 100.64.0.50.
   TAILSCALE_STATIC_IP: 100.64.0.50
-  GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
 
 jobs:
   build:
-    # Use GitHub's current Windows Server 2025 hosted image.
-    # This keeps Windows itself on C: and uses the newest supported runner image.
     runs-on: windows-2025
     timeout-minutes: 355
 
     steps:
+      # ---------------------------------------------------------------
+      # 1. Enable RDP & Network Performance
       # ---------------------------------------------------------------
       - name: 1. Enable RDP, Firewall, UDP Transport & Performance Tuning
         run: |
@@ -57,11 +30,14 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 0
           $tsPol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           New-Item -Path $tsPol -Force | Out-Null
-          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force   # Allow UDP + TCP
+          Set-ItemProperty -Path $tsPol -Name "SelectTransport" -Value 1 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "ColorDepth" -Value 24 -Type DWord -Force
           Set-ItemProperty -Path $tsPol -Name "fCompressionEnabled" -Value 1 -Type DWord -Force
           powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c 2>$null
           Write-Host ">>> RDP enabled (UDP transport) + High Performance power plan." -ForegroundColor Green
+
+      # ---------------------------------------------------------------
+      # 2. Configure Users
       # ---------------------------------------------------------------
       - name: 2. Create Admin Account
         run: |
@@ -70,49 +46,11 @@ jobs:
           Set-LocalUser -Name "CynetAdmin" -Password $Password -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Administrators" -Member "CynetAdmin" -ErrorAction SilentlyContinue
           net user runneradmin Cynet@2026
-      # ---------------------------------------------------------------
-      # ---------------------------------------------------------------
-      #  RESTORE the D: drive state saved by the PREVIOUS session.
-      #  key never hits (unique per run) -> restore-keys picks the newest
-      #  "dstate-" entry, i.e. the last session's backup.
-      # ---------------------------------------------------------------
-      - name: "3b. Restore previous session D: drive backup"
-        id: dstate
-        uses: actions/cache/restore@v4
-        with:
-          path: C:\_backup\dstate.7z
-          key: dstate-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: |
-            dstate-
 
-      - name: "3c. Unpack D: drive state"
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $sevenZip = "C:\Program Files\7-Zip\7z.exe"
-          New-Item -ItemType Directory -Force -Path "C:\_backup", "D:\Persist" | Out-Null
-          if (-not (Test-Path "C:\_backup\dstate.7z")) {
-            Write-Host "No previous backup found. Starting fresh."
-            "RESTORED=0" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-            exit 0
-          }
-          $size = (Get-Item "C:\_backup\dstate.7z").Length
-          Write-Host "Backup size: $size bytes"
-          if ($size -lt 1000) { throw "Backup archive is empty or invalid." }
-          & $sevenZip t "C:\_backup\dstate.7z" -bso0 -bsp0
-          if ($LASTEXITCODE -ne 0) { throw "Backup integrity test failed." }
-          & $sevenZip x "C:\_backup\dstate.7z" "-oD:\" -aoa -bso0 -bsp0
-          if ($LASTEXITCODE -ne 0) { throw "Backup extraction failed." }
-          if (-not (Test-Path "D:\Persist")) { throw "D:\Persist was not restored." }
-          Get-ChildItem "D:\Persist" -Recurse -Force | Select-Object -First 30 FullName, Length
-          "RESTORED=1" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
       # ---------------------------------------------------------------
-      #  NOTE: the Windows client has no --ephemeral flag, so this node
-      #  stays in your tailnet after the job ends. Step 4b cleans up any
-      #  stale nodes from previous sessions via the API, which also frees
-      #  the static IP so it can be pinned to this run.
+      # 3. Tailscale Setup
       # ---------------------------------------------------------------
-      - name: 4. Install & Connect Tailscale (optimized)
+      - name: 3. Install & Connect Tailscale
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
@@ -126,8 +64,6 @@ jobs:
                    --reset --ssh=false --accept-dns=false
           if ($LASTEXITCODE -ne 0) {
             Write-Host ">>> tailscale up FAILED (exit code $LASTEXITCODE)." -ForegroundColor Red
-            Write-Host "    Check that TAILSCALE_AUTHKEY secret is set, valid and reusable:" -ForegroundColor Red
-            Write-Host "    https://login.tailscale.com/admin/settings/keys" -ForegroundColor Red
             throw "Tailscale login failed - job aborted."
           }
           $ts_ip = $null
@@ -142,46 +78,21 @@ jobs:
               if ($stSelf.Self.TailscaleIPs) { $ts_ip = [string]$stSelf.Self.TailscaleIPs[0] }
             } catch { }
           }
-          if (-not $ts_ip) {
-            Write-Host ">>> WARN: Tailscale IP not assigned yet. Diagnostics:" -ForegroundColor Yellow
-            & $ts status
-            & $ts ip -4
-          }
-          $direct = $false
-          try {
-            $st = & $ts status --json 2>$null | ConvertFrom-Json
-            $peer = $st.Peer.Values | Select-Object -First 1
-            if ($peer) {
-              $direct = [string]::IsNullOrEmpty([string]$peer.Relay)
-              $derp  = if ($peer.Relay) { $peer.Relay } else { "direct (no relay)" }
-            }
-          } catch { }
+
           Write-Host ""
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> RDP SERVER IS READY! <<<" -ForegroundColor Cyan
           Write-Host "  Tailscale IP : $ts_ip" -ForegroundColor Yellow
-          Write-Host "  Username     : runneradmin   (GeForce NOW is installed in THIS profile)" -ForegroundColor Yellow
+          Write-Host "  Username     : runneradmin" -ForegroundColor Yellow
           Write-Host "  Alt user     : CynetAdmin" -ForegroundColor Yellow
           Write-Host "  Password     : Cynet@2026" -ForegroundColor Yellow
-          Write-Host "  Connection   : $derp" -ForegroundColor $(if ($direct) { "Green" } else { "Red" })
-          Write-Host "  >> Open mstsc and connect to: $ts_ip" -ForegroundColor Magenta
+          Write-Host "  >> Connect via mstsc to: $ts_ip" -ForegroundColor Magenta
           Write-Host "==================================================" -ForegroundColor Green
-          if (-not $direct) {
-            Write-Host ""
-            Write-Host ">>> HOW TO GET A DIRECT (FAST) CONNECTION <<<" -ForegroundColor Cyan
-            Write-Host " 1. Install Tailscale on YOUR PC too and log into the same account (tailscale.com/download)"
-            Write-Host " 2. Check 'tailscale status' on your PC - both machines should show 'direct'"
-            Write-Host " 3. Relayed usually means: closed UDP port 41641, CGNAT, or strict corporate firewall"
-            Write-Host " 4. Restart the client: 'tailscale down' then 'tailscale up' to re-negotiate a direct path"
-          }
+
       # ---------------------------------------------------------------
-      #  STATIC IP. Runs right after 'tailscale up'. Because the Windows
-      #  client has no --ephemeral flag, old nodes from previous sessions
-      #  linger in the tailnet and can hold the static IP. So we:
-      #    1) delete any stale "github-rdp-server*" nodes (API), and
-      #    2) pin TAILSCALE_STATIC_IP onto the current node (API).
+      # 4. Pin Static IP
       # ---------------------------------------------------------------
-      - name: "4b. Pin static Tailscale IP"
+      - name: 4. Pin static Tailscale IP
         env:
           TAILSCALE_APIKEY: ${{ secrets.TAILSCALE_APIKEY }}
         shell: powershell
@@ -196,7 +107,6 @@ jobs:
           }
           $headers = @{ Authorization = "Bearer $env:TAILSCALE_APIKEY" }
 
-          # 1) Clean up stale nodes from previous sessions (frees the IP)
           Write-Host ">>> Checking for stale nodes to remove ..." -ForegroundColor Cyan
           try {
             $devices = Invoke-RestMethod -Method Get `
@@ -212,122 +122,52 @@ jobs:
             Write-Host ">>> WARN: could not clean up stale nodes: $($_.Exception.Message)" -ForegroundColor Yellow
           }
 
-          # 2) Pin the static IP
           Write-Host ">>> Pinning IPv4 $ip onto node $nodeId ..." -ForegroundColor Cyan
           $body = (@{ ipv4 = $ip } | ConvertTo-Json -Compress)
           try {
             Invoke-RestMethod -Method Post -Uri "https://api.tailscale.com/api/v2/device/$nodeId/ip" `
               -Headers $headers -Body $body -ContentType "application/json" | Out-Null
             Write-Host ">>> Static IP applied: $ip" -ForegroundColor Green
-            # Give the control plane a beat, then confirm what we answer on now
             Start-Sleep -Seconds 3
             Write-Host "    tailscale ip -4 -> $((& $ts ip -4 2>$null))" -ForegroundColor Yellow
           } catch {
             Write-Host ">>> Failed to pin IP: $($_.Exception.Message)" -ForegroundColor Red
-            if ($_.ErrorDetails.Message) { Write-Host "    API said: $($_.ErrorDetails.Message)" -ForegroundColor Red }
-            Write-Host "    Checklist:" -ForegroundColor Red
-            Write-Host "      - TAILSCALE_APIKEY secret set? (admin console -> Settings -> Keys -> 'Generate API key' -> Devices: Read+Write)" -ForegroundColor Red
-            Write-Host "      - TAILSCALE_STATIC_IP inside your tailnet's allocated range?" -ForegroundColor Red
-            Write-Host "      - IP not already held by another machine (a conflicting one will 400)?" -ForegroundColor Red
           }
+
       # ---------------------------------------------------------------
-      - name: "5. Configure D: drive for applications and user data"
-        shell: powershell
-        run: |
-          $ErrorActionPreference = "Stop"
-          $folders = @(
-            "D:\Apps",
-            "D:\Persist\AppData",
-            "D:\Persist\AppData\Local",
-            "D:\Persist\AppData\Roaming",
-            "D:\Persist\Downloads",
-            "D:\Persist\Documents",
-            "D:\Persist\Desktop",
-            "D:\Persist\Pictures",
-            "D:\Persist\Temp"
-          )
-          New-Item -ItemType Directory -Force -Path $folders | Out-Null
-
-          # Do not change TEMP, TMP, APPDATA, LOCALAPPDATA, USERPROFILE,
-          # ProgramFiles, or Windows storage policies. Windows services,
-          # Microsoft Store, and AppX packages must continue using C:.
-          # Applications that support custom locations can be installed manually
-          # under D:\Apps.
-          Write-Host "Windows and Microsoft Store remain on C:."
-          Write-Host "Custom application location: D:\Apps"
-          Write-Host "Persistent data location: D:\Persist"
-
-      - name: 6. Install Python & Java (Adoptium Temurin 21)
+      # 5. Toolchains
+      # ---------------------------------------------------------------
+      - name: 5. Install Python & Java (Adoptium Temurin 21)
         run: |
           $ProgressPreference = 'SilentlyContinue'
           Write-Host ">>> Installing Python 3.12 ..." -ForegroundColor Cyan
           Invoke-WebRequest "https://www.python.org/ftp/python/3.12.3/python-3.12.3-amd64.exe" -OutFile "C:\python-installer.exe"
           Start-Process "C:\python-installer.exe" -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_pip=1" -Wait
           Remove-Item "C:\python-installer.exe" -Force -ErrorAction SilentlyContinue
+
           Write-Host ">>> Installing Eclipse Adoptium Temurin JDK 21 (LTS) ..." -ForegroundColor Cyan
           Invoke-WebRequest "https://api.adoptium.net/v3/binary/latest/21/ga/windows/x64/jdk/hotspot/normal/eclipse" -OutFile "C:\jdk.msi"
           Start-Process msiexec -ArgumentList '/i C:\jdk.msi /quiet ADDLOCAL=FeatureMain,FeatureEnvironment,FeatureJarFileRunWith,FeatureJavaHome /norestart' -Wait
           Remove-Item "C:\jdk.msi" -Force -ErrorAction SilentlyContinue
+
           $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
           Write-Host "==================================================" -ForegroundColor Green
           Write-Host "  >>> TOOLCHAIN SUMMARY <<<" -ForegroundColor Cyan
           $pyPath = (Get-Command python -ErrorAction SilentlyContinue).Source
           if ($pyPath) { Write-Host "  Python : $(& python --version) ($pyPath)" -ForegroundColor Yellow }
-          else         { Write-Host "  Python : NOT FOUND on PATH" -ForegroundColor Red }
           $javaPath = (Get-Command java -ErrorAction SilentlyContinue).Source
           if ($javaPath) { Write-Host "  Java   : $(& java -version 2>&1 | Select-Object -First 1) ($javaPath)" -ForegroundColor Yellow }
-          else           { Write-Host "  Java   : NOT FOUND on PATH" -ForegroundColor Red }
           Write-Host "  JAVA_HOME : $env:JAVA_HOME" -ForegroundColor Yellow
           Write-Host "==================================================" -ForegroundColor Green
+
       # ---------------------------------------------------------------
-      #  Keep alive + rolling snapshot of D:\Persist. Snapshotting during
-      #  the session means that even if the job is cancelled/timed out,
-      #  the final save step only has to upload an already-built archive.
+      # 6. Keep Alive
       # ---------------------------------------------------------------
-      - name: "7. Keep Server Alive + periodic D: snapshot"
+      - name: 6. Keep Server Alive
         shell: powershell
         run: |
-          $7z    = "C:\Program Files\7-Zip\7z.exe"
           $total = [int]$env:KEEPALIVE_MINUTES
-          $every = [int]$env:SNAPSHOT_EVERY_MIN
-          New-Item -ItemType Directory -Force -Path "$env:BACKUP_DIR" | Out-Null
           for ($i = 1; $i -le $total; $i++) {
             Start-Sleep -Seconds 60
-            if ($i % $every -eq 0 -or $i -eq $total) {
-              $tmp = "$env:BACKUP_DIR\dstate.tmp.7z"
-              Remove-Item $tmp -Force -ErrorAction SilentlyContinue
-              # -mx=1 fast compression, -ssw include files in use (GFN running)
-              & $7z a -t7z -mx=1 -ssw -bso0 -bsp0 $tmp "$env:PERSIST_DIR\*" `
-                    "-xr!*.log" "-xr!Crashpad" "-xr!Cache" "-xr!logs" 2>$null
-              if ($LASTEXITCODE -ne 0) { Write-Host "Backup creation failed: $LASTEXITCODE" -ForegroundColor Red }
-              if (Test-Path $tmp) {
-                Move-Item $tmp "$env:BACKUP_FILE" -Force
-                $mb = [math]::Round((Get-Item "$env:BACKUP_FILE").Length/1MB,1)
-                Write-Host "[$i/$total] snapshot updated ($mb MB)" -ForegroundColor DarkCyan
-              }
-            } else {
-              Write-Host "[$i/$total] Server running..."
-            }
+            Write-Host "[$i/$total] Server running..."
           }
-      # ---------------------------------------------------------------
-      #  SAVE the D: state for the next session. always() => also runs
-      #  when the job is cancelled or fails.
-      # ---------------------------------------------------------------
-      - name: "8a. Verify D: drive backup"
-        if: always()
-        shell: powershell
-        run: |
-          if (-not (Test-Path "$env:BACKUP_FILE")) {
-            Write-Error "Backup was not created: $env:BACKUP_FILE"
-            exit 1
-          }
-          $size = (Get-Item "$env:BACKUP_FILE").Length
-          Write-Host "Final backup size: $size bytes"
-          if ($size -lt 1000) { throw "Backup archive is empty." }
-
-      - name: "8b. Save D: drive backup for next session"
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: C:\_backup\dstate.7z
-          key: dstate-${{ github.run_id }}-${{ github.run_attempt }}
