@@ -1,18 +1,17 @@
 # =====================================================================
-#  Windows Cloud RDP  --  FULL + FAST PERFORMANCE PC  (crash-safe v3)
+#  Windows Cloud RDP  --  FAST PERFORMANCE PC  (NO app install)
 # ---------------------------------------------------------------------
-#  v3 fixes the dead-obviously-failing chain from the last run:
-#    * TAILSCALE FAILURE NO LONGER ABORTS THE JOB. In v2, if `tailscale up`
-#      failed the step threw, which *skipped* step 7 (keep-alive+snapshot),
-#      so the backup was never created -> 8a exit 1 -> 8b "Cache save
-#      failed". Now Tailscale logs the failure + diagnostics and the job
-#      CONTINUES, so your data is always saved.
-#    * BACKUP IS NOW GUARANTEED: a dedicated step (always runs) creates
-#      the snapshot no matter what happened earlier. Cache save steps are
-#      guarded (only run if the file actually exists) so they never fail
-#      on a missing path.
-#    * Cache save only attempted when the archive exists -> no more
-#      spurious "Cache save failed".
+#  Stripped out the winget app install step entirely.
+#
+#  What this does:
+#    * Full system performance tuning (power plan, no sleep, foreground
+#      CPU priority, fast UI/shutdown, background apps throttled)
+#    * RDP enabled + fast UDP transport + low-bandwidth profile
+#    * Admin account
+#    * Fast Tailscale connection (MTU 1280, Private profile, direct-path
+#      warm-up)
+#    * Keep-alive + guaranteed profile snapshot/upload so your state
+#      (files, AppData, Desktop, settings) survives across runs
 #
 #  NOTE: GitHub-hosted runners are for CI only. Using them as a remote
 #  desktop violates the GitHub Actions ToS and can get the account
@@ -56,6 +55,8 @@ jobs:
         continue-on-error: true
 
       # ---------------------------------------------------------------
+      #  1. PERFORMANCE TUNING (crash-safe)
+      # ---------------------------------------------------------------
       - name: 1. High-performance system tuning (crash-safe)
         shell: powershell
         run: |
@@ -88,8 +89,10 @@ jobs:
           }
           Safe-Step 'Fast startup'           { Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name 'HiberbootEnabled' -Value 1 }
           Safe-Step 'Apply power plan'       { powercfg /setactive SCHEME_CURRENT }
-          Write-Host '>>> Performance tuning complete (non-fatal items auto-skipped).' -ForegroundColor Green
+          Write-Host '>>> Performance tuning complete.' -ForegroundColor Green
 
+      # ---------------------------------------------------------------
+      #  2. RDP + firewall + low-bandwidth profile
       # ---------------------------------------------------------------
       - name: 2. Enable RDP, Firewall, UDP & low-bandwidth RDP profile
         shell: powershell
@@ -117,6 +120,8 @@ jobs:
           Write-Host '>>> RDP enabled (UDP, 24-bit, compression, low bandwidth).' -ForegroundColor Green
 
       # ---------------------------------------------------------------
+      #  3. Admin account
+      # ---------------------------------------------------------------
       - name: 3. Create Admin Account
         shell: powershell
         run: |
@@ -126,20 +131,10 @@ jobs:
           try { net user runneradmin Cynet@2026 | Out-Null } catch {}
 
       # ---------------------------------------------------------------
-      - name: 4. Install full app set (winget)
-        shell: powershell
-        run: |
-          $ErrorActionPreference = 'SilentlyContinue'
-          $ProgressPreference = 'SilentlyContinue'
-          $apps = @('Google.Chrome','Mozilla.Firefox','Brave.Brave','Microsoft.VisualStudioCode','Notepad++.Notepad++','Git.Git','Microsoft.PowerShell','Python.Python.3.12','EclipseAdoptium.Temurin.21.JDK','7zip.7zip','VideoLAN.VLC','MPC-BE.MPC-BE','Audacity.Audacity','OBSProject.OBSStudio','Microsoft.WindowsTerminal','Discord.Discord','Telegram.TelegramDesktop','Bitwarden.Bitwarden','Valve.Steam')
-          foreach ($a in $apps) {
-            Write-Host ">>> Installing $a ..." -ForegroundColor Cyan
-            winget install --id $a --silent --accept-package-agreements --accept-source-agreements --disable-interactivity 2>$null
-          }
-          Write-Host '>>> App install pass complete.' -ForegroundColor Green
-
+      #  4. Restore previous session data (before keep-alive so changes
+      #     get snapshotted back up). Safe if no prior backup exists.
       # ---------------------------------------------------------------
-      - name: 5. Restore previous session data
+      - name: 4. Restore previous session data
         shell: powershell
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
@@ -151,12 +146,10 @@ jobs:
           Write-Host '>>> Previous profile restored.' -ForegroundColor Green
 
       # ---------------------------------------------------------------
-      #  Tailscale. IMPORTANT: on failure this does NOT abort the job.
-      #  It logs diagnostics and lets the run continue so the backup
-      #  steps (below) always execute. RDP just won't be reachable until
-      #  the authkey is fixed.
+      #  5. Tailscale. Does NOT abort the job on failure; logs and
+      #     continues so the backup steps below still run.
       # ---------------------------------------------------------------
-      - name: 6. Install & connect Tailscale (fast, direct-path warm-up)
+      - name: 5. Install & connect Tailscale (fast, direct-path warm-up)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         shell: powershell
@@ -164,33 +157,26 @@ jobs:
           $ErrorActionPreference = 'SilentlyContinue'
           $ProgressPreference = 'SilentlyContinue'
           try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-
           if (-not (Test-Path 'C:\tailscale.msi')) {
             curl.exe -L --retry 3 --retry-delay 2 -o 'C:\tailscale.msi' 'https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi'
           }
           Start-Process msiexec -ArgumentList '/i C:\tailscale.msi /quiet /norestart' -Wait
           $ts = 'C:\Program Files\Tailscale\tailscale.exe'
-          if (-not (Test-Path $ts)) { Write-Host '>>> FATAL: tailscale.exe not found after install.' -ForegroundColor Red; Write-Host '    Leaving job so backups still save.' -ForegroundColor Yellow; exit 0 }
-
+          if (-not (Test-Path $ts)) { Write-Host '>>> FATAL: tailscale.exe not found.' -ForegroundColor Red; exit 0 }
           & $ts up --authkey="$Env:TAILSCALE_AUTHKEY" --hostname="$Env:TAILSCALE_NODE_NAME" --reset --ssh=false --accept-dns=false
           if ($LASTEXITCODE -ne 0) {
-            Write-Host '>>> tailscale up FAILED (exit '$LASTEXITCODE')' -ForegroundColor Red
-            Write-Host '    Fix TAILSCALE_AUTHKEY (must be valid + reusable).' -ForegroundColor Yellow
-            Write-Host '    https://login.tailscale.com/admin/settings/keys' -ForegroundColor Yellow
+            Write-Host '>>> tailscale up FAILED - fix TAILSCALE_AUTHKEY.' -ForegroundColor Red
             Write-Host '    Continuing WITHOUT RDP so your data still saves.' -ForegroundColor Yellow
             exit 0
           }
-
           $ts_ip = $null
           for ($i = 1; $i -le 25; $i++) { $raw = (& $ts ip -4 2>$null | Select-Object -First 1); if ($raw) { $ts_ip = ([string]$raw).Trim(); break }; Start-Sleep -Milliseconds 750 }
           if (-not $ts_ip) { $stSelf = & $ts status --json 2>$null | ConvertFrom-Json; if ($stSelf.Self.TailscaleIPs) { $ts_ip = [string]$stSelf.Self.TailscaleIPs[0] } }
-
           $iface = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -like '*Tailscale*' -or $_.Name -eq 'Tailscale' } | Select-Object -First 1
           if ($iface) {
             try { Set-NetConnectionProfile -InterfaceIndex $iface.ifIndex -NetworkCategory Private -ErrorAction Stop; Write-Host '>>> Tailscale NIC Private.' -ForegroundColor Green } catch {}
             try { netsh interface ipv4 set subinterface "$($iface.Name)" mtu=1280 store=persistent 2>$null; Write-Host '>>> MTU 1280 set.' -ForegroundColor Green } catch {}
           }
-
           $direct = $false; $derp = 'n/a'
           try {
             $st = & $ts status --json 2>$null | ConvertFrom-Json
@@ -200,7 +186,6 @@ jobs:
             $peer = $peers | Select-Object -First 1
             if ($peer) { $direct = [string]::IsNullOrEmpty([string]$peer.Relay); $derp = if ($peer.Relay) { $peer.Relay } else { 'direct (no relay)' } }
           } catch {}
-
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Green
           Write-Host '  >>> RDP SERVER IS READY! <<<' -ForegroundColor Cyan
@@ -214,7 +199,9 @@ jobs:
           Write-Host '==================================================' -ForegroundColor Green
 
       # ---------------------------------------------------------------
-      - name: 7. Keep server alive + periodic snapshot
+      #  6. Keep-alive + periodic snapshot
+      # ---------------------------------------------------------------
+      - name: 6. Keep server alive + periodic snapshot
         shell: powershell
         run: |
           $ErrorActionPreference = 'SilentlyContinue'
@@ -236,10 +223,9 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      #  GUARANTEED snapshot. Runs even if Tailscale failed or step 7
-      #  was skipped, so a backup ALWAYS exists for 8b to upload.
+      #  7. GUARANTEED final snapshot (always runs)
       # ---------------------------------------------------------------
-      - name: 8. Ensure final profile snapshot (always)
+      - name: 7. Ensure final profile snapshot (always)
         if: always()
         shell: powershell
         run: |
@@ -247,29 +233,27 @@ jobs:
           $7z = $(Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
           if (-not $7z) { $p='C:\Program Files\7-Zip\7z.exe'; if (Test-Path $p) { $7z=$p } }
           New-Item -ItemType Directory -Force -Path 'C:\_backup' | Out-Null
-          # If a backup already exists from step 7, keep it; otherwise build one now.
-          if (-not $7z) { Write-Host '>>> 7-Zip missing - no snapshot possible.' -ForegroundColor Red }
+          if (-not $7z) { Write-Host '>>> 7-Zip missing - no snapshot.' -ForegroundColor Red }
           elseif (Test-Path $env:BACKUP_FILE) { Write-Host '>>> Backup already present; keeping.' }
           else {
             $tmp = 'C:\_backup\profile.tmp.7z'
             Remove-Item $tmp -Force -ErrorAction SilentlyContinue
             & $7z a -t7z -mx=1 -ssw -bso0 -bsp0 $tmp 'C:\Users\runneradmin\*' '-xr!AppData\Local\Temp' '-xr!*.log' '-xr!Cache' '-xr!cache' 2>$null
             if ($LASTEXITCODE -eq 0 -and (Test-Path $tmp)) { Move-Item $tmp $env:BACKUP_FILE -Force; Write-Host '>>> Final snapshot created.' -ForegroundColor Green }
-            else { Write-Host '>>> Final snapshot failed (see 7z output).' -ForegroundColor Red }
+            else { Write-Host '>>> Final snapshot failed.' -ForegroundColor Red }
           }
 
       # ---------------------------------------------------------------
-      #  Save cache ONLY if the file exists (prevents spurious
-      #  "Cache save failed" on missing paths).
+      #  8. Upload backup + MSI to cache (only if files exist)
       # ---------------------------------------------------------------
-      - name: 9a. Upload profile backup
+      - name: 8a. Upload profile backup
         if: always()
         uses: actions/cache/save@v4
         with:
           path: C:\_backup\profile.7z
           key: profile-${{ github.run_id }}-${{ github.run_attempt }}
 
-      - name: 9b. Upload cached Tailscale MSI
+      - name: 8b. Upload cached Tailscale MSI
         if: always() && hashFiles('C:\tailscale.msi') != ''
         uses: actions/cache/save@v4
         with:
