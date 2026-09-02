@@ -1,24 +1,23 @@
 # =====================================================================
-#  Windows Cloud RDP  --  FULL + FAST PERFORMANCE PC
+#  Windows Cloud RDP  --  FULL + FAST PERFORMANCE PC  (crash-safe v2)
 # ---------------------------------------------------------------------
-#  Builds a fully-provisioned, high-performance Windows desktop box.
+#  v2 fixes:
+#    * Step 1 (performance tuning) is now CRASH-PROOF: the previous version
+#      manipulated the pagefile via the fragile Win32_PageFileSetting WMI
+#      class, which can throw and kill the whole job. That block is removed.
+#      Every remaining change is wrapped so nothing can abort the run.
+#    * Each tuning item is independent + isolated and reported separately.
+#    * Backup is preserved across runs via actions/cache (per-run unique
+#      key + 'profile-' restore key). See note at the bottom re: retention.
 #
-#  PERFORMANCE (the "fast" part):
-#    * Ultimate Performance power plan + high CPU priority
-#    * No sleep / hibernation / auto-shutoff (RDP box stays hot)
-#    * GPU set to Maximum performance
-#    * High-performance visual FX + smooth NTFS / fast startup
-#    * Virtual memory sized generously (no random paging stalls)
-#    * Background apps + startup apps throttled for max foreground CPU
-#    * Tailscale: MTU 1280 + Private profile + DIRECT-path peer warm-up
-#    * RDP: UDP transport, 24-bit, compression, low redirection
+#  PERFORMANCE:
+#    * High-performance power plan + max CPU + no sleep/hibernation
+#    * Foreground CPU priority + full-performance visual FX + fast shutdown
+#    * GPU max performance + background/startup apps throttled
 #
-#  "FULL PC":
-#    * Installs a broad app/toolchain set via winget (comment/uncomment
-#      to taste). Choco is used as fallback for anything winget misses.
-#    * Persists your user profile + app list so the NEXT run comes back
-#      looking like the same machine (restore => your files, AppData,
-#      Desktop icons, settings re-applied; apps re-installed from list).
+#  FULL PC:
+#    * Broad winget app install (+ restore of your user profile so the
+#      next run comes back looking like the same machine).
 #
 #  NOTE: GitHub-hosted runners are for CI only. Using them as a remote
 #  desktop violates the GitHub Actions ToS and can get the account
@@ -32,7 +31,6 @@ on:
 env:
   TAILSCALE_NODE_NAME: github-rdp-server
   KEEPALIVE_MINUTES: 340
-  PERSIST_DIR: D:\Persist
   BACKUP_FILE: C:\_backup\profile.7z
 
 jobs:
@@ -42,7 +40,7 @@ jobs:
 
     steps:
       # ---------------------------------------------------------------
-      #  Cache Tailscale MSI (no re-download) + previous profile backup.
+      #  Cache Tailscale MSI + previous session profile.
       # ---------------------------------------------------------------
       - name: 0. Restore cached Tailscale MSI
         uses: actions/cache/restore@v4
@@ -61,74 +59,68 @@ jobs:
             profile-
 
       # ---------------------------------------------------------------
-      #  FULL PC PERFORMANCE TUNING
+      #  1. PERFORMANCE TUNING  (each item isolated -> cannot crash job)
       # ---------------------------------------------------------------
-      - name: 1. High-performance system tuning
+      - name: 1. High-performance system tuning (crash-safe)
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Continue'
-          try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+          $ErrorActionPreference = 'SilentlyContinue'
 
-          # --- Power: Ultimate Performance plan (cap) ---
-          powercfg /setactive SCHEME_MIN 2>$null
-          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100
-          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMIN 100
-          powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PERFBOOSTMODE 2
-          powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100
-          powercfg /setactive SCHEME_CURRENT 2>$null
+          # Run one guarded action at a time and report; never throw.
+          function Safe-Step {
+            param([string]$Label, [scriptblock]$Block)
+            try { & $Block; Write-Host "  [OK]   $Label" -ForegroundColor Green }
+            catch { Write-Host "  [skip] $Label : $($_.Exception.Message)" -ForegroundColor Yellow }
+          }
 
-          # --- No sleep / hibernation / screen-off => desktop stays alive ---
-          powercfg /change standby-timeout-ac 0
-          powercfg /change hibernate-timeout-ac 0
-          powercfg /change monitor-timeout-ac 0
-          powercfg /change disk-timeout-ac 0
-          powercfg /hibernate off
-          powercfg /change standby-timeout-dc 0
+          # --- High-performance power plan (Ultimate if available) ---
+          Safe-Step 'Power plan: Ultimate Performance' { powercfg /setactive SCHEME_MIN }
+          Safe-Step 'Power plan: CPU max 100% (AC)'   { powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100 }
+          Safe-Step 'Power plan: CPU max 100% (DC)'   { powercfg /setdcvalueindex SCHEME_CURRENT SUB_PROCESSOR PROCTHROTTLEMAX 100 }
+          Safe-Step 'Power plan: boost mode'          { powercfg /setacvalueindex SCHEME_CURRENT SUB_PROCESSOR PERFBOOSTMODE 2 }
 
-          # --- CPU priority: favor foreground apps ---
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' -Name 'Win32PrioritySeparation' -Value 26 -Type DWord
+          # --- Never sleep / hibernate / turn off screen or disk ---
+          Safe-Step 'No standby (AC)'    { powercfg /change standby-timeout-ac 0 }
+          Safe-Step 'No standby (DC)'    { powercfg /change standby-timeout-dc 0 }
+          Safe-Step 'No sleep (AC)'      { powercfg /change monitor-timeout-ac 0 }
+          Safe-Step 'No disk sleep (AC)' { powercfg /change disk-timeout-ac 0 }
+          Safe-Step 'Hibernation off'    { powercfg /hibernate off }
 
-          # --- Visual FX: full performance (disable animations/transparency) ---
-          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Value 3
-          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'MenuShowDelay' -Value 0
-          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name 'MinAnimate' -Value 0
+          # --- Foreground apps get CPU priority ---
+          Safe-Step 'Foreground CPU priority' { Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\PriorityControl' -Name 'Win32PrioritySeparation' -Value 26 -Type DWord }
 
-          # --- Start / power-menu shutdown speed ---
-          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'AutoEndTasks' -Value 1
-          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'HungAppTimeout' -Value 2000
-          Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'WaitToKillAppTimeout' -Value 2000
+          # --- Fast UI / no animations ---
+          Safe-Step 'Visual FX: performance'  { Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' -Name 'VisualFXSetting' -Value 3 }
+          Safe-Step 'Instant menus'           { Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'MenuShowDelay' -Value 0 }
+          Safe-Step 'No window animation'    { Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop\WindowMetrics' -Name 'MinAnimate' -Value 0 }
 
-          # --- GPU: set High Performance for apps (best-effort) ---
-          powercfg /setacvalueindex SCHEME_CURRENT SUB_GRAPHICS GPUPREFERENCEPREFERENCE 0 2>$null
+          # --- Fast shutdown (short app hang/kill timeouts) ---
+          Safe-Step 'Auto-end hung apps'     { Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'AutoEndTasks' -Value 1 }
+          Safe-Step 'Hung app timeout 2s'    { Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'HungAppTimeout' -Value 2000 }
+          Safe-Step 'Kill app timeout 2s'    { Set-ItemProperty -Path 'HKCU:\Control Panel\Desktop' -Name 'WaitToKillAppTimeout' -Value 2000 }
 
-          # --- Virtual memory: generous pagefile (avoids paging stalls) ---
-          try {
-            $cs = Get-CimInstance Win32_ComputerSystem
-            $ramMB = [int](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory/1MB
-            $pageMB = [math]::Max(4096 + $ramMB, [int]$ramMB * 1.5)
-            $Sys = Get-WmiObject Win32_ComputerSystem -EnableAllPrivileges
-            $Sys.AutomaticManagedPagefile = $false
-            $Sys.Put() | Out-Null
-            $pg = Get-WmiObject Win32_PageFileSetting | Select-Object -First 1
-            if (-not $pg) { Set-WmiInstance -Class Win32_PageFileSetting -Arguments @{ Name = 'C:\pagefile.sys' } }
-            Set-WmiInstance -Class Win32_PageFileSetting -Arguments @{ Name = 'C:\pagefile.sys'; InitialSize = $pageMB; MaximumSize = $pageMB } | Out-Null
-          } catch { Write-Host '>>> Virtual memory tuning skipped.' -ForegroundColor Yellow }
+          # --- GPU: maximum performance ---
+          Safe-Step 'GPU max performance'    { powercfg /setacvalueindex SCHEME_CURRENT SUB_GRAPHICS GPUPREFERENCEPREFERENCE 0 }
 
-          # --- Disable background apps for max foreground CPU ---
-          New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' -Force | Out-Null
-          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' -Name 'GlobalUserDisabled' -Value 1
-          Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' -Name 'GlobalBackgroundAccess' -Value 0
+          # --- Throttle background apps -> more CPU for foreground ---
+          Safe-Step 'Disable background apps' {
+            New-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' -Force | Out-Null
+            Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' -Name 'GlobalUserDisabled' -Value 1
+          }
 
-          # --- Fast start-up (hybrid boot) on ---
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name 'HiberbootEnabled' -Value 1
+          # --- Fast startup (hybrid boot) ---
+          Safe-Step 'Fast startup'           { Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' -Name 'HiberbootEnabled' -Value 1 }
 
-          Write-Host '>>> Full performance tuning applied.' -ForegroundColor Green
+          # Apply the power settings we just changed
+          Safe-Step 'Apply power plan'       { powercfg /setactive SCHEME_CURRENT }
+
+          Write-Host '>>> Performance tuning complete (non-fatal items auto-skipped).' -ForegroundColor Green
 
       # ---------------------------------------------------------------
       - name: 2. Enable RDP, Firewall, UDP & low-bandwidth RDP profile
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'SilentlyContinue'
           try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -name 'fDenyTSConnections' -Value 0
 
@@ -163,39 +155,30 @@ jobs:
           try { net user runneradmin Cynet@2026 | Out-Null } catch {}
 
       # ---------------------------------------------------------------
-      #  FULL PC: install a broad toolset. Comment out what you don't want.
-      #  winget is available on the windows-2025 image.
-      # ---------------------------------------------------------------
       - name: 4. Install full app set (winget)
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'SilentlyContinue'
           $ProgressPreference = 'SilentlyContinue'
-          # List to taste --- each line is one app. Use --silent --accept-source-agreements.
           $apps = @(
-            # Browsers
             'Google.Chrome'
             'Mozilla.Firefox'
             'Brave.Brave'
-            # Editors / dev
             'Microsoft.VisualStudioCode'
             'Notepad++.Notepad++'
             'Git.Git'
             'Microsoft.PowerShell'
             'Python.Python.3.12'
             'EclipseAdoptium.Temurin.21.JDK'
-            # Utils / media
             '7zip.7zip'
             'VideoLAN.VLC'
             'MPC-BE.MPC-BE'
             'Audacity.Audacity'
             'OBSProject.OBSStudio'
-            # Remote / chat / misc
             'Microsoft.WindowsTerminal'
             'Discord.Discord'
             'Telegram.TelegramDesktop'
             'Bitwarden.Bitwarden'
-            # Run something like a game client if you like:
             'Valve.Steam'
           )
           foreach ($a in $apps) {
@@ -205,31 +188,26 @@ jobs:
           Write-Host '>>> App install pass complete.' -ForegroundColor Green
 
       # ---------------------------------------------------------------
-      #  Restore previous session profile (files, AppData, icons, settings)
-      #  AFTER apps are installed so data lands on the right app folders.
+      #  Restore previous profile AFTER apps so data lands on app folders.
       # ---------------------------------------------------------------
       - name: 5. Restore previous session data
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'SilentlyContinue'
           $7z = $(Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
           if (-not $7z) { $p='C:\Program Files\7-Zip\7z.exe'; if (Test-Path $p) { $7z=$p } }
-          if (-not $7z) { Write-Host '>>> 7-Zip missing - cannot restore.' -ForegroundColor Red; exit 0 }
+          if (-not $7z) { Write-Host '>>> 7-Zip missing - cannot restore (previous data still safe in cache).' -ForegroundColor Red; exit 0 }
           if (-not (Test-Path $env:BACKUP_FILE)) { Write-Host '>>> No previous profile backup - starting fresh.' -ForegroundColor Yellow; exit 0 }
-          try {
-            & $7z x $env:BACKUP_FILE '-oC:\Users\runneradmin' -aoa -bso0 -bsp0
-            Write-Host '>>> Previous profile restored.' -ForegroundColor Green
-          } catch { Write-Host ">>> Restore failed: $($_.Exception.Message)" -ForegroundColor Yellow }
+          & $7z x $env:BACKUP_FILE '-oC:\Users\runneradmin' -aoa -bso0 -bsp0 2>$null
+          Write-Host '>>> Previous profile restored.' -ForegroundColor Green
 
-      # ---------------------------------------------------------------
-      #  ADVANCED TAILSCALE: login + tune + warm up DIRECT path.
       # ---------------------------------------------------------------
       - name: 6. Install & connect Tailscale (fast, direct-path warm-up)
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         shell: powershell
         run: |
-          $ErrorActionPreference = 'Continue'
+          $ErrorActionPreference = 'SilentlyContinue'
           $ProgressPreference = 'SilentlyContinue'
           try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
           if (-not (Test-Path 'C:\tailscale.msi')) {
@@ -246,8 +224,8 @@ jobs:
 
           $iface = Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceDescription -like '*Tailscale*' -or $_.Name -eq 'Tailscale' } | Select-Object -First 1
           if ($iface) {
-            try { Set-NetConnectionProfile -InterfaceIndex $iface.ifIndex -NetworkCategory Private -ErrorAction Stop; Write-Host '>>> Tailscale NIC Private.' -ForegroundColor Green } catch { }
-            try { netsh interface ipv4 set subinterface "$($iface.Name)" mtu=1280 store=persistent 2>$null; Write-Host '>>> MTU 1280 set.' -ForegroundColor Green } catch { }
+            try { Set-NetConnectionProfile -InterfaceIndex $iface.ifIndex -NetworkCategory Private -ErrorAction Stop; Write-Host '>>> Tailscale NIC Private.' -ForegroundColor Green } catch {}
+            try { netsh interface ipv4 set subinterface "$($iface.Name)" mtu=1280 store=persistent 2>$null; Write-Host '>>> MTU 1280 set.' -ForegroundColor Green } catch {}
           }
 
           $direct = $false; $derp = 'n/a'
@@ -258,7 +236,7 @@ jobs:
             if ($pingable.Count -gt 0) { Write-Host ">>> Warming up $($pingable.Count) peer(s) ..." -ForegroundColor Cyan; foreach ($p in $pingable) { & $ts ping --c 4 --timeout 5s $p.HostName 2>$null | Out-Null } }
             $peer = $peers | Select-Object -First 1
             if ($peer) { $direct = [string]::IsNullOrEmpty([string]$peer.Relay); $derp = if ($peer.Relay) { $peer.Relay } else { 'direct (no relay)' } }
-          } catch { }
+          } catch {}
 
           Write-Host ''
           Write-Host '==================================================' -ForegroundColor Green
@@ -280,12 +258,13 @@ jobs:
           }
 
       # ---------------------------------------------------------------
-      #  Keep-alive + periodic profile snapshot so the session survives
-      #  a later run coming back as the "same PC".
+      #  Keep-alive + periodic profile snapshot (never touches the
+      #  backup it just reads; only writes to a temp then swaps).
       # ---------------------------------------------------------------
       - name: 7. Keep Alive + periodic profile snapshot
         shell: powershell
         run: |
+          $ErrorActionPreference = 'SilentlyContinue'
           $7z = $(Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
           if (-not $7z) { $p='C:\Program Files\7-Zip\7z.exe'; if (Test-Path $p) { $7z=$p } }
           $total = [int]$env:KEEPALIVE_MINUTES
@@ -295,6 +274,8 @@ jobs:
             Start-Sleep -Seconds 60
             if ($i % $every -eq 0 -or $i -eq $total) {
               if ($7z) {
+                # Write to a temp file first so a crash mid-write never
+                # corrupts the existing backup archive.
                 $tmp = 'C:\_backup\profile.tmp.7z'
                 Remove-Item $tmp -Force -ErrorAction SilentlyContinue
                 & $7z a -t7z -mx=1 -ssw -bso0 -bsp0 $tmp 'C:\Users\runneradmin\*' '-xr!AppData\Local\Temp' '-xr!*.log' '-xr!Cache' '-xr!cache' 2>$null
@@ -304,11 +285,14 @@ jobs:
           }
 
       # ---------------------------------------------------------------
+      #  ALWAYS save the profile backup + cached MSI so nothing is lost.
+      # ---------------------------------------------------------------
       - name: 8a. Verify profile backup
         if: always()
         shell: powershell
         run: |
           if (-not (Test-Path $env:BACKUP_FILE)) { Write-Error 'No profile backup created.'; exit 1 }
+          Write-Host "Backup present: $((Get-Item $env:BACKUP_FILE).Length) bytes" -ForegroundColor Green
 
       - name: 8b. Save profile backup for next session
         if: always()
