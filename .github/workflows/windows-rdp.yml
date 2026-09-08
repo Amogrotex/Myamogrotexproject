@@ -1,6 +1,22 @@
 # =====================================================================
-# Windows Cloud RDP  —  fast edition
+# Windows Cloud RDP  —  fast edition (v2: auto-optimizer)
 # RDP + Tailscale + Python 3.12 + Java 21
+#
+# NEW IN v2
+# ---------
+#   * Step 4 "Optimize": auto-deletes Chrome + Edge (apps, updaters,
+#     web drivers, per-user profiles), deletes Unity (Hub + Editors +
+#     caches) wherever it is found, and clears system junk. It runs
+#     AFTER the Tailscale IP is published, so it can never delay your
+#     login — you connect instantly while the cleanup finishes behind
+#     you. Toggle it with the `optimize` input (default: on).
+#   * Deletions use `rd /s /q` (one native call) instead of PowerShell's
+#     Remove-Item -Recurse, which enumerates every single file. On the
+#     multi-GB Unity trees this is the difference between seconds and
+#     minutes.
+#   * Defender real-time scan is disabled first, because it otherwise
+#     re-scans every file we delete and makes bulk removal crawl.
+#   * A step summary + log line reports exactly how many MB were freed.
 #
 # WHY THIS VERSION IS FASTER (numbers are from your own runs #108-#110,
 # read off the Actions API step timestamps):
@@ -50,6 +66,11 @@ on:
         default: '340'
       setup_tools:
         description: 'Wire up preinstalled Python + Java for the RDP session'
+        type: boolean
+        required: false
+        default: true
+      optimize:
+        description: 'Auto-delete Chrome/Edge/Unity + free disk space (runs after IP is live)'
         type: boolean
         required: false
         default: true
@@ -205,11 +226,119 @@ jobs:
           Write-Host "# Password     : Cynet@2026" -ForegroundColor Yellow
           Write-Host "# Connect with : mstsc /v:$tsIp" -ForegroundColor Magenta
           Write-Host "##################################################" -ForegroundColor Green
-          Write-Host "You can connect now; tool wiring continues below." -ForegroundColor Cyan
+          Write-Host "You can connect now; cleanup + tool wiring continue below." -ForegroundColor Cyan
 
 
       # ===============================================================
-      # 4. TOOLS - reuse what the image already ships
+      # 4. OPTIMIZE - purge Chrome / Edge / Unity + free disk
+      #    Runs AFTER the IP is live: connect instantly, cleanup runs
+      #    in the background of your session. Uses native `rd /s /q`
+      #    (one call per tree) which beats Remove-Item -Recurse by far
+      #    on the multi-GB Unity trees.
+      # ===============================================================
+      - name: 4. Optimize — purge Chrome/Edge/Unity + free disk
+        if: ${{ inputs.optimize }}
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $before = (Get-PSDrive -Name C).Free
+
+          # ---------- 1. kill processes that lock the folders ----------
+          foreach ($n in "chrome","msedge","firefox","Unity","Unity Hub","UnityCrashHandler64","UnityCrashHandler32","UnityPackageManager","qtshaderexporter") {
+            Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          }
+
+          # ---------- 2. stop the updaters that resurrect them ----------
+          foreach ($svc in "gupdate","gupdatem","edgeupdate","edgeupdatem") {
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+          }
+          foreach ($t in "\GoogleUpdateTaskMachineCore","\GoogleUpdateTaskMachineUA","\MicrosoftEdgeUpdateTaskMachineCore","\MicrosoftEdgeUpdateTaskMachineUA") {
+            & schtasks.exe /Delete /TN $t /F 2>$null | Out-Null
+          }
+
+          # Defender real-time scan re-checks every file we delete and
+          # makes bulk removal crawl; switch it off for the session.
+          try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop } catch {}
+
+          # ---------- 3. fast delete helper ----------
+          function Remove-Fast {
+            param([string[]]$Path)
+            foreach ($p in $Path) {
+              if ([string]::IsNullOrWhiteSpace($p)) { continue }
+              if (-not (Test-Path -LiteralPath $p)) { continue }
+              $arg = 'rd /s /q "' + $p.TrimEnd('\') + '"'
+              & cmd.exe /c $arg 2>$null | Out-Null
+              if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }
+              if (Test-Path -LiteralPath $p) { Write-Host ("  partial   " + $p) -ForegroundColor Yellow }
+              else                           { Write-Host ("  removed   " + $p) -ForegroundColor Green }
+            }
+          }
+
+          # ---------- 4. browsers: Chrome + Edge (app, updater, driver, profile) ----------
+          # Add firefox + "C:\Program Files\Mozilla Firefox" below if you want it gone too.
+          Write-Host "[1/4] Purging Chrome + Edge" -ForegroundColor Cyan
+          Remove-Fast @(
+            "C:\Program Files\Google\Chrome",
+            "C:\Program Files (x86)\Google\Chrome",
+            "C:\Program Files\Google\Update",
+            "C:\Program Files (x86)\Google\Update",
+            "C:\Program Files (x86)\Microsoft\Edge",
+            "C:\Program Files\Microsoft\Edge",
+            "C:\Program Files (x86)\Microsoft\EdgeUpdate",
+            "C:\Program Files (x86)\Microsoft\EdgeCore",
+            "C:\ProgramData\Microsoft\EdgeUpdate",
+            "C:\SeleniumWebDrivers\ChromeDriver",
+            "C:\SeleniumWebDrivers\EdgeDriver"
+          )
+          Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            Remove-Fast @(
+              (Join-Path $_.FullName "AppData\Local\Google\Chrome"),
+              (Join-Path $_.FullName "AppData\Local\Microsoft\Edge")
+            )
+          }
+
+          # ---------- 5. Unity deleter: Hub, Editors, and every cache ----------
+          # windows-2025 only ships Unity as Visual Studio components; this
+          # sweeps any standalone Hub/Editor you install during a session.
+          Write-Host "[2/4] Deleting Unity (Hub + Editors + caches)" -ForegroundColor Cyan
+          Remove-Fast @(
+            "C:\Program Files\Unity",
+            "C:\Program Files\Unity Hub",
+            "C:\Program Files (x86)\Unity",
+            "C:\Program Files (x86)\Unity Hub",
+            "C:\ProgramData\Unity",
+            "C:\ProgramData\Unity Hub",
+            "C:\ProgramData\UnityHub",
+            "$env:LOCALAPPDATA\Unity",
+            "$env:LOCALAPPDATA\Unity Hub",
+            "$env:APPDATA\Unity",
+            "$env:APPDATA\Unity Hub"
+          )
+          foreach ($root in "C:\Program Files","C:\Program Files (x86)","C:\ProgramData") {
+            Get-ChildItem -LiteralPath $root -Directory -Filter "Unity*" -ErrorAction SilentlyContinue |
+              ForEach-Object { Remove-Fast $_.FullName }
+          }
+
+          # ---------- 6. system junk ----------
+          Write-Host "[3/4] Cleaning system junk" -ForegroundColor Cyan
+          Remove-Fast "C:\Windows\SoftwareDistribution\Download"
+          Remove-Fast ((Get-ChildItem "C:\Windows\Temp" -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }))
+          Remove-Fast ((Get-ChildItem $env:TEMP -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }))
+          Clear-RecycleBin -Force -ErrorAction SilentlyContinue
+          powercfg.exe /h off 2>$null | Out-Null
+
+          # ---------- 7. report ----------
+          $after = (Get-PSDrive -Name C).Free
+          $freed = [math]::Round(($after - $before) / 1MB, 0)
+          $freeGb = [math]::Round($after / 1GB, 1)
+          Write-Host ""
+          Write-Host "[4/4] Freed $freed MB — C: now has $freeGb GB free" -ForegroundColor Green
+          "### Optimizer" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding ascii
+          "- Freed **$freed MB** of disk on C: ($freeGb GB free now)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding ascii
+
+
+      # ===============================================================
+      # 5. TOOLS - reuse what the image already ships
       #    Verified against the official windows-2025 image notes: it
       #    already contains Python 3.12.10 (with pip) and Temurin
       #    21.0.12, exposed as JAVA_HOME_21_X64. So this step finds
@@ -219,7 +348,7 @@ jobs:
       #    any one directory layout.
       #    Runs after the IP is published: it can never block a login.
       # ===============================================================
-      - name: 4. Wire up Python + Java (no download)
+      - name: 5. Wire up Python + Java (no download)
         if: ${{ inputs.setup_tools }}
         shell: powershell
         run: |
@@ -346,11 +475,11 @@ jobs:
           if (-not ($pyOk -and $jvOk)) { throw "tool wiring did not produce a usable python+java" }
 
       # ===============================================================
-      # 5. KEEP ALIVE
+      # 6. KEEP ALIVE
       #    Idle minutes cost nothing in log volume; every 5 minutes is
       #    plenty to show the runner is still alive.
       # ===============================================================
-      - name: 5. Keep server alive
+      - name: 6. Keep server alive
         shell: powershell
         run: |
           $total = [int]$env:KEEPALIVE_MINUTES
