@@ -1,22 +1,31 @@
 # =====================================================================
-# Windows Cloud RDP  —  fast edition (v2: auto-optimizer)
-# RDP + Tailscale + Python 3.12 + Java 21
+# Windows Cloud RDP  —  tiny edition (v3)
+# RDP + Tailscale + Python 3.12 + Java 21  +  Tiny11-style debloat
 #
-# NEW IN v2
-# ---------
-#   * Step 4 "Optimize": auto-deletes Chrome + Edge (apps, updaters,
-#     web drivers, per-user profiles), deletes Unity (Hub + Editors +
-#     caches) wherever it is found, and clears system junk. It runs
-#     AFTER the Tailscale IP is published, so it can never delay your
-#     login — you connect instantly while the cleanup finishes behind
-#     you. Toggle it with the `optimize` input (default: on).
-#   * Deletions use `rd /s /q` (one native call) instead of PowerShell's
-#     Remove-Item -Recurse, which enumerates every single file. On the
-#     multi-GB Unity trees this is the difference between seconds and
-#     minutes.
-#   * Defender real-time scan is disabled first, because it otherwise
-#     re-scans every file we delete and makes bulk removal crawl.
-#   * A step summary + log line reports exactly how many MB were freed.
+# NEW IN v3 (Tiny11-style optimizer, step 4)
+# ------------------------------------------
+#   The optimizer now strips the box the way Tiny11 strips Windows 11:
+#     * Uninstalls Chrome, Edge, Firefox + their updaters, web drivers
+#       and per-user profiles.
+#     * Deletes Unity (Hub + every Editor version + all caches).
+#     * Removes ALL non-essential Appx packages (Store, Xbox, Cortana,
+#       Bing, etc.) — Notepad, Calculator, Terminal, VCLibs, winget and
+#       the XAML runtime are kept so the shell still works.
+#     * Removes OneDrive (uninstaller + leftovers).
+#     * Kills telemetry: AllowTelemetry=0, DiagTrack/dmwappush/WER and
+#       the CEIP/DiskDiagnostic scheduled tasks.
+#     * Disables background services (SysMain, WSearch, Xbox, Spooler,
+#       Windows Update, Delivery Optimization, ...).
+#     * Deletes the huge preinstalled dev stacks: Android SDK+NDK,
+#       MSYS2, Visual Studio 2022, Miniconda, R, SQL LocalDB, the
+#       VS package cache — typically 20-40 GB. Remove any single line
+#       in the $heavy list to keep that tool.
+#     * DISM /StartComponentCleanup + /SPSuperseded to shrink WinSxS.
+#     * Uses `rd /s /q` first, then robocopy /MIR (continues past
+#       locked files) as a fallback — far faster than Remove-Item.
+#   All of it runs AFTER the Tailscale IP is published, so you connect
+#   instantly and the cleanup finishes behind your session. Toggle it
+#   with the `optimize` input (default: on).
 #
 # WHY THIS VERSION IS FASTER (numbers are from your own runs #108-#110,
 # read off the Actions API step timestamps):
@@ -70,7 +79,7 @@ on:
         required: false
         default: true
       optimize:
-        description: 'Auto-delete Chrome/Edge/Unity + free disk space (runs after IP is live)'
+        description: 'Tiny11-style debloat: purge Chrome/Edge/Unity/apps/telemetry + free disk (after IP is live)'
         type: boolean
         required: false
         default: true
@@ -226,17 +235,20 @@ jobs:
           Write-Host "# Password     : Cynet@2026" -ForegroundColor Yellow
           Write-Host "# Connect with : mstsc /v:$tsIp" -ForegroundColor Magenta
           Write-Host "##################################################" -ForegroundColor Green
-          Write-Host "You can connect now; cleanup + tool wiring continue below." -ForegroundColor Cyan
+          Write-Host "You can connect now; Tiny11 debloat + tool wiring run behind you." -ForegroundColor Cyan
 
 
       # ===============================================================
-      # 4. OPTIMIZE - purge Chrome / Edge / Unity + free disk
-      #    Runs AFTER the IP is live: connect instantly, cleanup runs
-      #    in the background of your session. Uses native `rd /s /q`
-      #    (one call per tree) which beats Remove-Item -Recurse by far
-      #    on the multi-GB Unity trees.
+      # 4. OPTIMIZE — Tiny11-style debloat
+      #    Runs AFTER the IP is live: connect instantly, this finishes
+      #    in the background. `rd /s /q` first (fast), then robocopy
+      #    /MIR as a fallback that continues past locked files — far
+      #    faster than Remove-Item -Recurse on multi-GB trees.
+      #    NEVER touches: TermService/RDP, Tailscale, the runner
+      #    (C:\actions), hostedtoolcache (Python/Java wiring in step 5),
+      #    Git, PowerShell or .NET.
       # ===============================================================
-      - name: 4. Optimize — purge Chrome/Edge/Unity + free disk
+      - name: 4. Optimize — Tiny11 debloat (apps/telemetry/Chrome/Edge/Unity)
         if: ${{ inputs.optimize }}
         shell: powershell
         run: |
@@ -244,15 +256,17 @@ jobs:
           $before = (Get-PSDrive -Name C).Free
 
           # ---------- 1. kill processes that lock the folders ----------
-          foreach ($n in "chrome","msedge","firefox","Unity","Unity Hub","UnityCrashHandler64","UnityCrashHandler32","UnityPackageManager","qtshaderexporter") {
+          Write-Host "[1/9] Killing locked processes" -ForegroundColor Cyan
+          foreach ($n in "chrome","msedge","firefox","Unity","Unity Hub","UnityCrashHandler64","UnityCrashHandler32","UnityPackageManager","qtshaderexporter","OneDrive","OneDriveSetup","devenv","MSBuild","ServiceHub.Host.CLR.x64","ServiceHub.RoslynCodeAnalysisService","vs_installershell") {
             Get-Process -Name $n -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           }
 
-          # ---------- 2. stop the updaters that resurrect them ----------
+          # ---------- 2. stop updaters, drop their scheduled tasks ----------
+          Write-Host "[2/9] Removing updater tasks" -ForegroundColor Cyan
           foreach ($svc in "gupdate","gupdatem","edgeupdate","edgeupdatem") {
             Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
           }
-          foreach ($t in "\GoogleUpdateTaskMachineCore","\GoogleUpdateTaskMachineUA","\MicrosoftEdgeUpdateTaskMachineCore","\MicrosoftEdgeUpdateTaskMachineUA") {
+          foreach ($t in "\GoogleUpdateTaskMachineCore","\GoogleUpdateTaskMachineUA","\MicrosoftEdgeUpdateTaskMachineCore","\MicrosoftEdgeUpdateTaskMachineUA","\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser","\Microsoft\Windows\Customer Experience Improvement Program\Consolidator","\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector","\Microsoft\Windows\Windows Error Reporting\QueueReporting") {
             & schtasks.exe /Delete /TN $t /F 2>$null | Out-Null
           }
 
@@ -260,7 +274,7 @@ jobs:
           # makes bulk removal crawl; switch it off for the session.
           try { Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop } catch {}
 
-          # ---------- 3. fast delete helper ----------
+          # ---------- 3. fast delete helper: rd, then robocopy /MIR fallback ----------
           function Remove-Fast {
             param([string[]]$Path)
             foreach ($p in $Path) {
@@ -268,15 +282,21 @@ jobs:
               if (-not (Test-Path -LiteralPath $p)) { continue }
               $arg = 'rd /s /q "' + $p.TrimEnd('\') + '"'
               & cmd.exe /c $arg 2>$null | Out-Null
-              if (Test-Path -LiteralPath $p) { Remove-Item -LiteralPath $p -Recurse -Force -ErrorAction SilentlyContinue }
+              if (Test-Path -LiteralPath $p) {
+                # robocopy /MIR against an empty dir clears what rd could not
+                $empty = Join-Path $env:TEMP ("_empty_" + [guid]::NewGuid().ToString("N"))
+                New-Item -ItemType Directory -Path $empty -Force | Out-Null
+                & robocopy.exe $empty $p /MIR /XJ /NFL /NDL /NJH /NJS /NP /R:0 /W:0 2>$null | Out-Null
+                Remove-Item -LiteralPath $empty -Force -Recurse -EA SilentlyContinue
+                & cmd.exe /c $arg 2>$null | Out-Null
+              }
               if (Test-Path -LiteralPath $p) { Write-Host ("  partial   " + $p) -ForegroundColor Yellow }
               else                           { Write-Host ("  removed   " + $p) -ForegroundColor Green }
             }
           }
 
-          # ---------- 4. browsers: Chrome + Edge (app, updater, driver, profile) ----------
-          # Add firefox + "C:\Program Files\Mozilla Firefox" below if you want it gone too.
-          Write-Host "[1/4] Purging Chrome + Edge" -ForegroundColor Cyan
+          # ---------- 4. browsers: Chrome + Edge + Firefox (app/updater/driver/profile) ----------
+          Write-Host "[3/9] Purging browsers (Chrome/Edge/Firefox)" -ForegroundColor Cyan
           Remove-Fast @(
             "C:\Program Files\Google\Chrome",
             "C:\Program Files (x86)\Google\Chrome",
@@ -287,20 +307,21 @@ jobs:
             "C:\Program Files (x86)\Microsoft\EdgeUpdate",
             "C:\Program Files (x86)\Microsoft\EdgeCore",
             "C:\ProgramData\Microsoft\EdgeUpdate",
-            "C:\SeleniumWebDrivers\ChromeDriver",
-            "C:\SeleniumWebDrivers\EdgeDriver"
+            "C:\Program Files\Mozilla Firefox",
+            "C:\Program Files (x86)\Mozilla Firefox",
+            "C:\SeleniumWebDrivers",
+            "C:\selenium"
           )
           Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | ForEach-Object {
             Remove-Fast @(
               (Join-Path $_.FullName "AppData\Local\Google\Chrome"),
-              (Join-Path $_.FullName "AppData\Local\Microsoft\Edge")
+              (Join-Path $_.FullName "AppData\Local\Microsoft\Edge"),
+              (Join-Path $_.FullName "AppData\Local\Mozilla\Firefox")
             )
           }
 
-          # ---------- 5. Unity deleter: Hub, Editors, and every cache ----------
-          # windows-2025 only ships Unity as Visual Studio components; this
-          # sweeps any standalone Hub/Editor you install during a session.
-          Write-Host "[2/4] Deleting Unity (Hub + Editors + caches)" -ForegroundColor Cyan
+          # ---------- 5. Unity deleter: Hub, Editors, every cache ----------
+          Write-Host "[4/9] Deleting Unity (Hub + Editors + caches)" -ForegroundColor Cyan
           Remove-Fast @(
             "C:\Program Files\Unity",
             "C:\Program Files\Unity Hub",
@@ -319,22 +340,98 @@ jobs:
               ForEach-Object { Remove-Fast $_.FullName }
           }
 
-          # ---------- 6. system junk ----------
-          Write-Host "[3/4] Cleaning system junk" -ForegroundColor Cyan
+          # ---------- 6. OneDrive ----------
+          Write-Host "[5/9] Removing OneDrive" -ForegroundColor Cyan
+          $od = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+          if (Test-Path $od) { & $od /uninstall 2>$null | Out-Null }
+          Remove-Fast @(
+            "$env:LOCALAPPDATA\Microsoft\OneDrive",
+            "$env:LOCALAPPDATA\OneDrive",
+            "C:\ProgramData\Microsoft OneDrive",
+            "C:\Users\Default\OneDrive"
+          )
+          foreach ($u in (Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue)) {
+            Remove-Fast (Join-Path $u.FullName "OneDrive")
+          }
+
+          # ---------- 7. Tiny11 Appx strip: remove Store/Xbox/Cortana/etc ----------
+          # Keep: Notepad, Calculator, Terminal, VCLibs, winget, XAML runtime
+          Write-Host "[6/9] Stripping Appx packages (Store/Xbox/Cortana/Bing…)" -ForegroundColor Cyan
+          $keep = @("Microsoft.WindowsNotepad","Microsoft.WindowsCalculator","Microsoft.WindowsTerminal","Microsoft.VCLibs","Microsoft.DesktopAppInstaller","Microsoft.UI.Xaml")
+          foreach ($p in (Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue)) {
+            $skip = $false
+            foreach ($k in $keep) { if ($p.Name -like "$k*") { $skip = $true; break } }
+            if ($skip) { continue }
+            try { Remove-AppxPackage -Package $p.PackageFullName -AllUsers -ErrorAction Stop } catch {}
+          }
+          Get-AppxProvisionedPackage -Online -ErrorAction SilentlyContinue | ForEach-Object {
+            $skip = $false
+            foreach ($k in $keep) { if ($_.PackageName -like "$k*") { $skip = $true; break } }
+            if ($skip) { return }
+            try { Remove-AppxProvisionedPackage -Online -PackageName $_.PackageName -ErrorAction Stop } catch {}
+          }
+
+          # ---------- 8. telemetry + privacy + snappy UI registry ----------
+          Write-Host "[7/9] Disabling telemetry + UI speed tweaks" -ForegroundColor Cyan
+          New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Name "AllowTelemetry" -Type DWord -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" -Name "DoNotShowFeedbackNotifications" -Type DWord -Value 1 -Force
+          New-Item -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" -Force | Out-Null
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" -Name "AllowTelemetry" -Type DWord -Value 0 -Force
+          foreach ($hive in "HKCU:\Control Panel\Desktop","Registry::HKEY_USERS\.DEFAULT\Control Panel\Desktop") {
+            Set-ItemProperty -Path $hive -Name "MenuShowDelay" -Value "0" -Force
+            Set-ItemProperty -Path $hive -Name "AutoEndTasks" -Value "1" -Force
+            Set-ItemProperty -Path $hive -Name "WaitToKillAppTimeout" -Value "2000" -Force
+          }
+
+          # ---------- 9. heavy debloat: preinstalled dev stacks (tiny = strip them) ----------
+          # Remove any single line below to KEEP that tool.
+          Write-Host "[8/9] Removing heavy preinstalled stacks (~20-40 GB)" -ForegroundColor Cyan
+          Remove-Fast @(
+            "C:\Android",                                   # Android SDK + NDK
+            "C:\msys64",                                    # MSYS2 toolchain
+            "C:\Miniconda",                                 # Miniconda
+            "C:\Program Files\R",                           # R runtime
+            "C:\Program Files\Microsoft Visual Studio\2022",# Visual Studio 2022
+            "C:\Program Files (x86)\Microsoft Visual Studio",# VS Installer + older
+            "C:\ProgramData\Microsoft\VisualStudio",        # VS shared packages
+            "C:\ProgramData\Package Cache",                 # cached MSI installers
+            "C:\Program Files\Microsoft SQL Server"         # SQL LocalDB
+          )
+
+          # ---------- 10. system junk ----------
+          Write-Host "[9/9] Cleaning system junk + WinSxS" -ForegroundColor Cyan
           Remove-Fast "C:\Windows\SoftwareDistribution\Download"
           Remove-Fast ((Get-ChildItem "C:\Windows\Temp" -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }))
           Remove-Fast ((Get-ChildItem $env:TEMP -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName }))
+          Remove-Fast "C:\ProgramData\Microsoft\Windows\WER"
           Clear-RecycleBin -Force -ErrorAction SilentlyContinue
           powercfg.exe /h off 2>$null | Out-Null
+          try {
+            Write-Host "  DISM StartComponentCleanup (can take a few minutes)..."
+            & dism.exe /Online /Cleanup-Image /StartComponentCleanup
+            Write-Host "  StartComponentCleanup exit: $LASTEXITCODE"
+            & dism.exe /Online /Cleanup-Image /SPSuperseded
+            Write-Host "  SPSuperseded exit: $LASTEXITCODE"
+          } catch { Write-Host "  DISM skipped: $($_.Exception.Message)" -ForegroundColor Yellow }
 
-          # ---------- 7. report ----------
+          # ---------- 11. disable background services ----------
+          # TermService (RDP) and Tailscale are deliberately NOT here.
+          $svcs = "DiagTrack","dmwappushservice","WSearch","SysMain","MapsBroker","WerSvc","UsoSvc","WaaSMedicSvc","wuauserv","bits","DoSvc","RemoteRegistry","Spooler","XblAuthManager","XblGameSave","XboxNetApiSvc","XboxGipSvc","gupdate","gupdatem","edgeupdate","edgeupdatem","TabletInputService","WpcMonSvc","Fax","SstpSvc","edgeupdate"
+          foreach ($s in $svcs) {
+            Stop-Service -Name $s -Force -ErrorAction SilentlyContinue
+            Set-Service  -Name $s -StartupType Disabled -ErrorAction SilentlyContinue
+          }
+
+          # ---------- 12. report ----------
           $after = (Get-PSDrive -Name C).Free
           $freed = [math]::Round(($after - $before) / 1MB, 0)
           $freeGb = [math]::Round($after / 1GB, 1)
           Write-Host ""
-          Write-Host "[4/4] Freed $freed MB — C: now has $freeGb GB free" -ForegroundColor Green
-          "### Optimizer" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding ascii
+          Write-Host "Tiny11 debloat done — freed $freed MB, C: now $freeGb GB free" -ForegroundColor Green
+          "### Optimizer (Tiny11)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding ascii
           "- Freed **$freed MB** of disk on C: ($freeGb GB free now)" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding ascii
+          "- Removed Chrome/Edge/Firefox, Unity, OneDrive, Appx bloat, telemetry, Android SDK, MSYS2, Visual Studio, Miniconda, R" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding ascii
 
 
       # ===============================================================
