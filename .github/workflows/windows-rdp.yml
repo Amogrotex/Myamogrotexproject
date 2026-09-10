@@ -34,7 +34,7 @@ name: Windows Cloud RDP
 
 # Hardcoded RDP password (single source of truth - edit here only).
 env:
-  RDP_PASSWORD: 'Amog!Rdp7#Kx92mQ'   # <-- EDIT: your Windows password (user: runneradmin)
+  RDP_PASSWORD: 'airjoker'   # <-- EDIT: your Windows password (user: runneradmin)
 
 on:
   workflow_dispatch:
