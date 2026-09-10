@@ -34,7 +34,7 @@ name: Windows Cloud RDP
 
 # Hardcoded RDP password (single source of truth - edit here only).
 env:
-  RDP_PASSWORD: 'airjoker'   # <-- EDIT: your Windows password (user: runneradmin)
+  RDP_PASSWORD: 'cynet@2026'   # <-- EDIT: password (user: CynetAdmin, backup: runneradmin)
 
 on:
   workflow_dispatch:
@@ -62,10 +62,10 @@ on:
           - tailscale
           - any
       nla:
-        description: 'Network Level Authentication ON (faster + safer; OFF only for legacy clients)'
+        description: 'Network Level Authentication (OFF matches the classic mstsc login flow)'
         type: boolean
         required: false
-        default: true
+        default: false
 
 # Least privilege: the job only reads the repo.
 permissions:
@@ -272,7 +272,7 @@ jobs:
             "| --- | --- |",
             "| Address | ``$ip`` |",
             "| Connect | ``mstsc /v:$ip`` |",
-            "| User    | ``runneradmin`` |",
+            "| User    | ``CynetAdmin`` (backup: ``runneradmin``) |",
             "| Password| hardcoded in this workflow (env.RDP_PASSWORD at top) |",
             "| NLA     | ${{ inputs.nla }} |",
             "| Scope   | ${{ inputs.rdp_scope }} |",
