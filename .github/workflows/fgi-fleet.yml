@@ -88,6 +88,28 @@ jobs:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           use-cache: 'true'
 
+      - name: Cockpit 1b - resolve Tailscale IPv4 (the v3 action exports no IP!)
+        id: tsip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          $ip = $null
+          for ($i = 0; $i -lt 120; $i++) {
+            $cand = ([string](& $tsExe ip -4 2>$null | Select-Object -First 1)).Trim()
+            if ($cand -match '^100\.') { $ip = $cand; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ip) { throw 'ROOT-CAUSE: cockpit got no Tailscale IPv4.' }
+          "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
+          try {
+            & $tsExe set --hostname=mainy 2>$null
+            Write-Host 'Tailscale hostname set to: mainy' -ForegroundColor Green
+          } catch {
+            Write-Host ('hostname rename skipped: ' + $_.Exception.Message) -ForegroundColor Yellow
+          }
+          Write-Host "Cockpit Tailscale IP: $ip" -ForegroundColor Green
+
       - name: Cockpit 2 - enable + tune RDP
         shell: pwsh
         run: |
@@ -272,18 +294,40 @@ jobs:
           Set-Content -Path 'C:\FGI\workers.txt' -Value $ips -Encoding ascii
           Write-Host ("Worker list: " + ($ips -join ', ')) -ForegroundColor Green
 
-      - name: Cockpit 5 - publish connection info
+      - name: Cockpit 5 - register + publish connection info
         shell: pwsh
         run: |
-          $ip = "${{ steps.ts.outputs.tailscale_ip }}"
+          $ErrorActionPreference = 'Continue'
+          $ip = "${{ steps.tsip.outputs.tailscale_ip }}"
+          if (-not $ip -or $ip -notmatch '^100\.') { throw "ROOT-CAUSE: empty/invalid cockpit IP '$ip' (tsip output missing)." }
+          $repo   = $env:GITHUB_REPOSITORY
+          $branch = $env:GITHUB_REF_NAME
+          $json   = '{"ip":"' + $ip + '","role":"cockpit","name":"mainy"}'
+          $b64    = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+          $sha = $null
+          try { $sha = gh api "repos/$repo/contents/.fgi/cockpit.json?ref=$branch" --jq '.sha' 2>$null } catch {}
+          if ($sha) {
+            gh api "repos/$repo/contents/.fgi/cockpit.json" --method PUT -f message="fgi: register cockpit" -f content="$b64" -f branch="$branch" -f sha="$sha" --silent
+          } else {
+            gh api "repos/$repo/contents/.fgi/cockpit.json" --method PUT -f message="fgi: register cockpit" -f content="$b64" -f branch="$branch" --silent
+          }
+          Write-Host ("::notice title=RDP ADDRESS::Connect with: mstsc /v:" + $ip + "   (user: runneradmin)")
+          Write-Host ''
+          Write-Host '################################################' -ForegroundColor Magenta
+          Write-Host '#  RDP ADDRESS:' $ip -ForegroundColor Magenta
+          Write-Host '#  COMMAND:     mstsc /v:' $ip -ForegroundColor Magenta
+          Write-Host '#  USER:        runneradmin' -ForegroundColor Magenta
+          Write-Host '################################################' -ForegroundColor Magenta
           @(
-            '### FGI Fleet online',
+            '### FGI Fleet online - server name: **mainy**',
             '',
             "| Setting | Value |",
             "| --- | --- |",
-            "| Cockpit (RDP) | ``mstsc /v:$ip`` - user ``runneradmin`` |",
+            "| **RDP ADDRESS** | ``$ip`` |",
+            "| **Connect** | ``mstsc /v:$ip`` |",
+            '| User | ``runneradmin`` |',
+            '| Password | env.RDP_PASSWORD in this workflow |',
             "| Workers | ${{ needs.setup.outputs.count }} (list auto-built in C:\FGI\workers.txt) |",
-            "| Password | env.RDP_PASSWORD in this workflow |",
             '',
             'On the desktop, open **cmd** and try:',
             '',
@@ -346,6 +390,12 @@ jobs:
           }
           if (-not $ip) { throw 'ROOT-CAUSE: worker got no Tailscale IPv4.' }
           "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
+          try {
+            & $tsExe set --hostname=("mainy-w" + $env:SHARD_INDEX) 2>$null
+            Write-Host ("Tailscale hostname set to: mainy-w" + $env:SHARD_INDEX) -ForegroundColor Green
+          } catch {
+            Write-Host ('hostname rename skipped: ' + $_.Exception.Message) -ForegroundColor Yellow
+          }
           $repo   = $env:GITHUB_REPOSITORY
           $branch = $env:GITHUB_REF_NAME
           $path   = ".fgi/worker-$env:SHARD_INDEX.json"
