@@ -1,0 +1,58 @@
+# =====================================================================
+# Windows RDP Restart - one-click "reboot" for the cloud system
+# ---------------------------------------------------------------------
+# GitHub hosted runners are EPHEMERAL VMs: there is nothing persistent
+# to reboot. "Restarting the system" = cancel the current run (VM is
+# destroyed) and dispatch a brand-new one (fresh Windows, ~1 min).
+#
+# How to use: Actions tab > "Windows RDP Restart" > Run workflow.
+# The old session (and its Tailscale IP) dies; grab the NEW IP from the
+# summary of the fresh "Windows Cloud RDP" run that this starts.
+#
+# NOTE: do NOT reboot Windows from inside the RDP session - that kills
+# the runner agent and fails the job. Always use this workflow instead.
+# =====================================================================
+
+name: Windows RDP Restart
+
+on:
+  workflow_dispatch:
+    inputs:
+      keepalive_minutes:
+        description: 'Minutes for the fresh session'
+        required: false
+        default: '340'
+
+permissions:
+  actions: write   # needed to cancel runs + dispatch workflows
+
+jobs:
+  restart:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+
+      - name: Cancel the running RDP session(s)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow=windows-rdp.yml --status=in_progress \
+                   --json databaseId --jq '.[].databaseId')
+          if [ -z "$runs" ]; then
+            echo "No running RDP session to cancel."
+          else
+            for id in $runs; do
+              echo "Cancelling run $id ..."
+              gh run cancel "$id" || true
+            done
+            sleep 10   # let the cancellation propagate
+          fi
+
+      - name: Start a fresh Windows system
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run windows-rdp.yml \
+            -f keepalive_minutes="${{ inputs.keepalive_minutes }}"
+          echo "Fresh Windows VM launching now."
+          echo "Check the Actions tab -> 'Windows Cloud RDP' -> newest run for the new Tailscale IP (~1 min)."
