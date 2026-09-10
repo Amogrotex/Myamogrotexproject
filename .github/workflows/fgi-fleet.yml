@@ -24,7 +24,7 @@
 name: FGI Fleet
 
 env:
-  RDP_PASSWORD: 'Amog!Rdp7#Kx92mQ'      # <-- EDIT: Windows password (user: runneradmin)
+  RDP_PASSWORD: 'airjoker'      # <-- EDIT: Windows password (user: runneradmin)
   FGI_TOKEN: 'Amog-Fgi-Tok-2026-x7Q'    # <-- EDIT: internal fleet token (any random string)
 
 on:
