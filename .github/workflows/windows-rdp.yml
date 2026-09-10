@@ -121,6 +121,12 @@ jobs:
             throw "ROOT-CAUSE: no 100.x IPv4 after 60s (expired/revoked authkey is the usual cause)."
           }
           "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
+          try {
+            & $ts set --hostname=mainy 2>$null
+            Write-Host 'Tailscale hostname set to: mainy' -ForegroundColor Green
+          } catch {
+            Write-Host ('hostname rename skipped: ' + $_.Exception.Message) -ForegroundColor Yellow
+          }
           Write-Host "Tailscale IP: $ip" -ForegroundColor Green
 
       # -------------------------------------------------------------
