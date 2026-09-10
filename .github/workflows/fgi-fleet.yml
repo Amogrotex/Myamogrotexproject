@@ -167,7 +167,7 @@ jobs:
           New-Item -ItemType Directory -Path 'C:\FGI' -Force | Out-Null
           Set-Content -Path 'C:\FGI\fgi.cmd' -Encoding ascii -Value @'
           @echo off
-          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0fgi.ps1" %*
+          powershell -NoProfile -ExecutionPolicy Bypass -File "C:\FGI\fgi.ps1" %*
           '@
           Set-Content -Path 'C:\FGI\fgi.ps1' -Encoding ascii -Value @'
           # FGI - run one command on every fleet worker's persistent cmd session.
@@ -273,7 +273,16 @@ jobs:
           if ($userPath -notlike '*C:\FGI*') {
             [Environment]::SetEnvironmentVariable('Path', $userPath + ';C:\FGI', 'User')
           }
-          Write-Host 'FGI installed to C:\FGI (on PATH for new cmd windows).' -ForegroundColor Green
+          # MACHINE-scope PATH: applies to EVERY user (the RDP login is
+          # CynetAdmin, not the runner admin - user-scope PATH was the bug)
+          $machPath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+          if ($machPath -notlike '*C:\FGI*') {
+            [Environment]::SetEnvironmentVariable('Path', $machPath + ';C:\FGI', 'Machine')
+          }
+          # Desktop copy for CynetAdmin: wrapper now targets C:\FGI\fgi.ps1
+          # absolutely, so it works from any directory
+          Copy-Item 'C:\FGI\fgi.cmd' 'C:\Users\CynetAdmin\Desktop\FGI.cmd' -Force -ErrorAction SilentlyContinue
+          Write-Host 'FGI installed (machine PATH + desktop copy for CynetAdmin).' -ForegroundColor Green
 
       - name: Cockpit 4 - wait for workers + build worker list
         shell: pwsh
