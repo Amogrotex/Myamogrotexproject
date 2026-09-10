@@ -24,7 +24,7 @@
 name: FGI Fleet
 
 env:
-  RDP_PASSWORD: 'airjoker'      # <-- EDIT: Windows password (user: runneradmin)
+  RDP_PASSWORD: 'cynet@2026'      # <-- EDIT: password (user: CynetAdmin, backup: runneradmin)
   FGI_TOKEN: 'Amog-Fgi-Tok-2026-x7Q'    # <-- EDIT: internal fleet token (any random string)
 
 on:
@@ -137,6 +137,16 @@ jobs:
           net user runneradmin /active:yes | Out-Null
           Add-LocalGroupMember -Group 'Administrators'       -Member 'runneradmin' -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'runneradmin' -ErrorAction SilentlyContinue
+
+          # CynetAdmin - the primary login (owner-requested)
+          if (Get-LocalUser -Name CynetAdmin -ErrorAction SilentlyContinue) {
+            Set-LocalUser  -Name CynetAdmin -Password $pw
+          } else {
+            New-LocalUser  -Name CynetAdmin -Password $pw -PasswordNeverExpires -AccountNeverExpires
+          }
+          net user CynetAdmin /active:yes | Out-Null
+          Add-LocalGroupMember -Group 'Administrators'       -Member 'CynetAdmin' -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'CynetAdmin' -ErrorAction SilentlyContinue
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
           foreach ($proto in 'TCP','UDP') {
             $dn = "FGI cockpit RDP $proto 3389"
@@ -311,12 +321,12 @@ jobs:
           } else {
             gh api "repos/$repo/contents/.fgi/cockpit.json" --method PUT -f message="fgi: register cockpit" -f content="$b64" -f branch="$branch" --silent
           }
-          Write-Host ("::notice title=RDP ADDRESS::Connect with: mstsc /v:" + $ip + "   (user: runneradmin)")
+          Write-Host ("::notice title=RDP ADDRESS::Connect with: mstsc /v:" + $ip + "   (user: CynetAdmin)")
           Write-Host ''
           Write-Host '################################################' -ForegroundColor Magenta
           Write-Host '#  RDP ADDRESS:' $ip -ForegroundColor Magenta
           Write-Host '#  COMMAND:     mstsc /v:' $ip -ForegroundColor Magenta
-          Write-Host '#  USER:        runneradmin' -ForegroundColor Magenta
+          Write-Host '#  USER:        CynetAdmin' -ForegroundColor Magenta
           Write-Host '################################################' -ForegroundColor Magenta
           @(
             '### FGI Fleet online - server name: **mainy**',
@@ -325,7 +335,7 @@ jobs:
             "| --- | --- |",
             "| **RDP ADDRESS** | ``$ip`` |",
             "| **Connect** | ``mstsc /v:$ip`` |",
-            '| User | ``runneradmin`` |',
+            '| User | ``CynetAdmin`` (backup: ``runneradmin``) |',
             '| Password | env.RDP_PASSWORD in this workflow |',
             "| Workers | ${{ needs.setup.outputs.count }} (list auto-built in C:\FGI\workers.txt) |",
             '',
@@ -338,7 +348,7 @@ jobs:
             '```',
             ''
           ) >> $env:GITHUB_STEP_SUMMARY
-          Write-Host "COCKPIT READY -> mstsc /v:$ip (user: runneradmin)" -ForegroundColor Magenta
+          Write-Host "COCKPIT READY -> mstsc /v:$ip (user: CynetAdmin)" -ForegroundColor Magenta
 
       - name: Cockpit 6 - keep session alive
         shell: pwsh
