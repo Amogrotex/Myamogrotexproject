@@ -1,0 +1,552 @@
+# =====================================================================
+# FGI Fleet - RDP cockpit + worker VMs you command with "FGI <command>"
+# ---------------------------------------------------------------------
+# WHAT YOU GET
+#   1 Windows RDP desktop (the COCKPIT) + up to 18 worker VMs, all in
+#   one private Tailscale network. Open any cmd window on the desktop:
+#
+#     FGI cd desktop            -> runs on EVERY worker, session persists
+#     FGI pip install requests  -> runs in the SAME session (same cwd!)
+#     FGI status                -> ping all workers
+#     FGI list                  -> show worker IPs
+#     FGI help
+#
+#   Each worker runs a small agent holding ONE persistent cmd.exe; FGI
+#   broadcasts to all of them over the tailnet (token-protected).
+#
+# SETUP
+#   - repo secret TAILSCALE_AUTHKEY (reusable + ephemeral key)
+#   - password + FGI token: edit the env: block right below
+#   - workers self-register under .fgi/ in the repo; the cockpit turns
+#     that into C:\FGI\workers.txt for you
+# =====================================================================
+
+name: FGI Fleet
+
+env:
+  RDP_PASSWORD: 'Amog!Rdp7#Kx92mQ'      # <-- EDIT: Windows password (user: runneradmin)
+  FGI_TOKEN: 'Amog-Fgi-Tok-2026-x7Q'    # <-- EDIT: internal fleet token (any random string)
+
+on:
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: 'Worker VMs (0-18; cockpit+workers must fit the 20-job plan limit)'
+        required: false
+        default: '3'
+      keepalive_minutes:
+        description: 'Session minutes'
+        required: false
+        default: '340'
+      boot_command:
+        description: 'Optional command run on every worker at boot (in the persistent cmd)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # workers self-register under .fgi/
+
+jobs:
+
+  # ================================================================
+  # SETUP - shard matrix [0..N-1]
+  # ================================================================
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      count: ${{ steps.mk.outputs.count }}
+    steps:
+      - name: Build worker list
+        id: mk
+        shell: bash
+        run: |
+          n=$(( ${{ inputs.shards || 3 }} ))
+          if [ "$n" -lt 0 ]; then n=0; fi
+          if [ "$n" -gt 18 ]; then n=18; fi
+          if [ "$n" -eq 0 ]; then list='[]'; else list=$(python3 -c "print(list(range($n)))"); fi
+          echo "matrix=$list" >> "$GITHUB_OUTPUT"
+          echo "count=$n"    >> "$GITHUB_OUTPUT"
+          echo "Fleet: cockpit + $n worker(s)"
+
+  # ================================================================
+  # COCKPIT - your RDP desktop with the FGI tool installed
+  # ================================================================
+  cockpit:
+    needs: setup
+    runs-on: windows-2025
+    timeout-minutes: 355
+    env:
+      GH_TOKEN: ${{ github.token }}
+      WORKERS_EXPECTED: ${{ needs.setup.outputs.count }}
+    steps:
+      - name: Cockpit 1 - connect Tailscale
+        id: ts
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          use-cache: 'true'
+
+      - name: Cockpit 2 - enable + tune RDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ts  = "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server"
+          $rdp = "$ts\WinStations\RDP-Tcp"
+          $pol = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $pol -Force | Out-Null
+          Set-ItemProperty -Path $ts  -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path $rdp -Name UserAuthentication  -Value 0 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $pol -Name fCompressionEnabled  -Type DWord -Value 1 -Force
+          foreach ($n in 'fDisableWallpaper','fDisableFullWindowDrag','fDisableMenuAnims','fDisableThemes') {
+            Set-ItemProperty -Path $rdp -Name $n -Value 1 -ErrorAction SilentlyContinue
+          }
+          powercfg /setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          if (Get-LocalUser -Name runneradmin -ErrorAction SilentlyContinue) {
+            Set-LocalUser  -Name runneradmin -Password $pw
+          } else {
+            New-LocalUser  -Name runneradmin -Password $pw -PasswordNeverExpires -AccountNeverExpires
+          }
+          net user runneradmin /active:yes | Out-Null
+          Add-LocalGroupMember -Group 'Administrators'       -Member 'runneradmin' -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member 'runneradmin' -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          foreach ($proto in 'TCP','UDP') {
+            $dn = "FGI cockpit RDP $proto 3389"
+            Remove-NetFirewallRule -DisplayName $dn -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName $dn -Direction Inbound -Protocol $proto `
+              -LocalPort 3389 -RemoteAddress '100.64.0.0/10' -Action Allow -Profile Any | Out-Null
+          }
+          Set-Service   -Name TermService -StartupType Automatic -ErrorAction SilentlyContinue
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          $deny = (Get-ItemProperty $ts -Name fDenyTSConnections -ErrorAction SilentlyContinue).fDenyTSConnections
+          if ($deny -ne 0) { throw "ROOT-CAUSE: RDP not enabled (fDenyTSConnections=$deny)" }
+          Write-Host 'Cockpit RDP ready.' -ForegroundColor Green
+
+      - name: Cockpit 3 - install FGI tool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path 'C:\FGI' -Force | Out-Null
+          Set-Content -Path 'C:\FGI\fgi.cmd' -Encoding ascii -Value @'
+          @echo off
+          powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0fgi.ps1" %*
+          '@
+          Set-Content -Path 'C:\FGI\fgi.ps1' -Encoding ascii -Value @'
+          # FGI - run one command on every fleet worker's persistent cmd session.
+          # Usage (from any cmd window on the cockpit):
+          #   FGI cd desktop                 run on ALL workers (state persists!)
+          #   FGI pip install requests       runs in the SAME session, same cwd
+          #   FGI status                     ping every worker
+          #   FGI list                       show worker IPs
+          #   FGI refresh                    rescan the tailnet for fgi-worker-* nodes
+          #   FGI help                       this help
+          param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Rest)
+          $ErrorActionPreference = 'Continue'
+          $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
+          $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+
+          $token = ''
+          if (Test-Path "$dir\token.txt") { $token = ((Get-Content "$dir\token.txt") -join '').Trim() }
+
+          function Get-Workers {
+              $file = "$dir\workers.txt"
+              if (-not (Test-Path $file)) { return @() }
+              return @(Get-Content $file | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+          }
+
+          function Update-Workers {
+              # Prune: keep only workers that answer /ping right now (works offline
+              # inside the RDP session - no GitHub API needed).
+              $file = "$dir\workers.txt"
+              $alive = @()
+              foreach ($ip in (Get-Workers)) {
+                  try {
+                      $null = Invoke-WebRequest -Uri ("http://{0}:8442/ping" -f $ip) -Headers @{ 'X-FGI-Token' = $token } -TimeoutSec 4 -UseBasicParsing
+                      $alive += $ip
+                  } catch {
+                      Write-Host ("dropping unresponsive worker " + $ip) -ForegroundColor Yellow
+                  }
+              }
+              Set-Content -Path $file -Value $alive -Encoding ascii
+              Write-Host ('Alive workers: ' + $alive.Count + ' -> ' + ($alive -join ', ')) -ForegroundColor Green
+          }
+
+          $cmd = ''
+          if ($Rest) { $cmd = ($Rest -join ' ') }
+
+          if ($cmd -eq '' -or $cmd -eq 'help') {
+              Write-Host 'FGI - fleet command runner. Usage:'
+              Write-Host '  FGI <command>     run <command> on every worker (persistent sessions)'
+              Write-Host '  FGI status        ping every worker'
+              Write-Host '  FGI list          show worker IPs'
+              Write-Host '  FGI refresh       ping all known workers, drop unresponsive ones'
+              return
+          }
+          if ($cmd -eq 'refresh') { Update-Workers; return }
+          if ($cmd -eq 'list') {
+              $w = Get-Workers
+              if ($w.Count -eq 0) { Write-Host 'No workers known. Try: FGI refresh' -ForegroundColor Yellow }
+              else { $i = 0; foreach ($ip in $w) { Write-Host ("[{0}] {1}" -f $i, $ip); $i++ } }
+              return
+          }
+          if ($cmd -eq 'status') {
+              $w = Get-Workers
+              if ($w.Count -eq 0) { Write-Host 'No workers known. Try: FGI refresh' -ForegroundColor Yellow; return }
+              foreach ($ip in $w) {
+                  try {
+                      $r = Invoke-WebRequest -Uri ("http://{0}:8442/ping" -f $ip) -Headers @{ 'X-FGI-Token' = $token } -TimeoutSec 8 -UseBasicParsing
+                      Write-Host ("[{0}] ONLINE  {1}" -f $ip, $r.Content) -ForegroundColor Green
+                  } catch {
+                      Write-Host ("[{0}] OFFLINE ({1})" -f $ip, $_.Exception.Message) -ForegroundColor Red
+                  }
+              }
+              return
+          }
+
+          # ---- default: broadcast the command to every worker ----
+          $w = Get-Workers
+          if ($w.Count -eq 0) {
+              Write-Host 'No workers known yet - scanning tailnet...' -ForegroundColor Yellow
+              Update-Workers
+              $w = Get-Workers
+              if ($w.Count -eq 0) { Write-Host 'Still no fgi-worker-* nodes found. Did the fleet start?' -ForegroundColor Red; return }
+          }
+          $fail = 0
+          $i = 0
+          foreach ($ip in $w) {
+              Write-Host ("=== [{0}/{1}] {2} ===" -f ($i + 1), $w.Count, $ip) -ForegroundColor Cyan
+              try {
+                  $r = Invoke-WebRequest -Uri ("http://{0}:8442/exec" -f $ip) -Method Post -Body $cmd -ContentType 'text/plain' -Headers @{ 'X-FGI-Token' = $token } -TimeoutSec 150 -UseBasicParsing
+                  Write-Host $r.Content
+                  if ($r.Content -match 'FGI_EXIT=(\d+)') {
+                      if ([int]$Matches[1] -ne 0) { $fail++ }
+                  }
+              } catch {
+                  Write-Host ('OFFLINE/ERROR: ' + $_.Exception.Message) -ForegroundColor Red
+                  $fail++
+              }
+              $i++
+          }
+          Write-Host ('--- done: ' + ($w.Count - $fail) + ' ok, ' + $fail + ' failed/exit-nonzero ---') -ForegroundColor ($fail -eq 0 ? 'Green' : 'Yellow')
+          '@
+          Set-Content -Path 'C:\FGI\token.txt'  -Encoding ascii -Value $env:FGI_TOKEN
+          Set-Content -Path 'C:\FGI\workers.txt' -Encoding ascii -Value ''
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -notlike '*C:\FGI*') {
+            [Environment]::SetEnvironmentVariable('Path', $userPath + ';C:\FGI', 'User')
+          }
+          Write-Host 'FGI installed to C:\FGI (on PATH for new cmd windows).' -ForegroundColor Green
+
+      - name: Cockpit 4 - wait for workers + build worker list
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $repo   = $env:GITHUB_REPOSITORY
+          $branch = $env:GITHUB_REF_NAME
+          $want   = [int]$env:WORKERS_EXPECTED
+          $ips    = @()
+          for ($attempt = 0; $attempt -lt 60; $attempt++) {
+            $ips = @()
+            try {
+              $names = @(gh api "repos/$repo/contents/.fgi" --jq '.[].name' 2>$null)
+              foreach ($nm in $names) {
+                try {
+                  $b64 = (gh api "repos/$repo/contents/.fgi/$nm" --jq '.content' 2>$null) -join ''
+                  $json = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(($b64 -replace '\s', '')))
+                  $m = [regex]::Match($json, '"ip"\s*:\s*"(100\.[0-9.]+)"')
+                  if ($m.Success) { $ips += $m.Groups[1].Value }
+                } catch {}
+              }
+            } catch {}
+            $ips = @($ips | Select-Object -Unique)
+            Write-Host ("[{0}/60] registered workers: {1} (want {2})" -f ($attempt + 1), $ips.Count, $want)
+            if ($want -eq 0 -or $ips.Count -ge $want) { break }
+            Start-Sleep -Seconds 5
+          }
+          Set-Content -Path 'C:\FGI\workers.txt' -Value $ips -Encoding ascii
+          Write-Host ("Worker list: " + ($ips -join ', ')) -ForegroundColor Green
+
+      - name: Cockpit 5 - publish connection info
+        shell: pwsh
+        run: |
+          $ip = "${{ steps.ts.outputs.tailscale_ip }}"
+          @(
+            '### FGI Fleet online',
+            '',
+            "| Setting | Value |",
+            "| --- | --- |",
+            "| Cockpit (RDP) | ``mstsc /v:$ip`` - user ``runneradmin`` |",
+            "| Workers | ${{ needs.setup.outputs.count }} (list auto-built in C:\FGI\workers.txt) |",
+            "| Password | env.RDP_PASSWORD in this workflow |",
+            '',
+            'On the desktop, open **cmd** and try:',
+            '',
+            '```',
+            'FGI cd desktop',
+            'FGI pip install requests',
+            'FGI status',
+            '```',
+            ''
+          ) >> $env:GITHUB_STEP_SUMMARY
+          Write-Host "COCKPIT READY -> mstsc /v:$ip (user: runneradmin)" -ForegroundColor Magenta
+
+      - name: Cockpit 6 - keep session alive
+        shell: pwsh
+        run: |
+          $total = 340
+          try { $total = [int]'${{ inputs.keepalive_minutes }}' } catch {}
+          if ($total -le 0) { $total = 340 }
+          if ($total -gt 340) { $total = 340 }
+          Write-Host "Cockpit online for $total minutes." -ForegroundColor Green
+          for ($i = 1; $i -le $total; $i++) {
+            Start-Sleep -Seconds 60
+            if (($i % 5) -eq 0) { Write-Host "[$i/$total min] cockpit running" -ForegroundColor Green }
+          }
+
+  # ================================================================
+  # WORKERS - one agent VM per shard, registers itself, waits for FGI
+  # ================================================================
+  workers:
+    if: ${{ needs.setup.outputs.count != '0' }}
+    needs: setup
+    runs-on: windows-2025
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        shard: ${{ fromJson(needs.setup.outputs.matrix) }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHARD_INDEX: ${{ matrix.shard }}
+    steps:
+      - name: Worker ${{ matrix.shard }} - connect Tailscale
+        id: ts
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          use-cache: 'true'
+
+      - name: Worker ${{ matrix.shard }} - get IP + register in repo
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          $ip = $null
+          for ($i = 0; $i -lt 120; $i++) {
+            $cand = ([string](& $tsExe ip -4 2>$null | Select-Object -First 1)).Trim()
+            if ($cand -match '^100\.') { $ip = $cand; break }
+            Start-Sleep -Milliseconds 500
+          }
+          if (-not $ip) { throw 'ROOT-CAUSE: worker got no Tailscale IPv4.' }
+          "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
+          $repo   = $env:GITHUB_REPOSITORY
+          $branch = $env:GITHUB_REF_NAME
+          $path   = ".fgi/worker-$env:SHARD_INDEX.json"
+          $json   = '{"ip":"' + $ip + '","shard":' + $env:SHARD_INDEX + '}'
+          $b64    = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json))
+          $sha = $null
+          try { $sha = gh api "repos/$repo/contents/$path?ref=$branch" --jq '.sha' 2>$null } catch {}
+          if ($sha) {
+            gh api "repos/$repo/contents/$path" --method PUT -f message="fgi: register worker $env:SHARD_INDEX" -f content="$b64" -f branch="$branch" -f sha="$sha" --silent
+          } else {
+            gh api "repos/$repo/contents/$path" --method PUT -f message="fgi: register worker $env:SHARD_INDEX" -f content="$b64" -f branch="$branch" --silent
+          }
+          Write-Host "Registered as $path -> $ip" -ForegroundColor Green
+
+      - name: Worker ${{ matrix.shard }} - install + start FGI agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Path 'C:\FGI' -Force | Out-Null
+          New-NetFirewallRule -DisplayName 'FGI Agent 8442' -Direction Inbound -Protocol TCP `
+            -LocalPort 8442 -RemoteAddress '100.64.0.0/10' -Action Allow -Profile Any -ErrorAction SilentlyContinue | Out-Null
+          netsh http add urlacl url='http://+:8442/' sddl='D:(A;;GX;;;WD)' 2>$null | Out-Null
+          Set-Content -Path 'C:\FGI\agent.ps1' -Encoding ascii -Value @'
+          # FGI worker agent - holds ONE persistent shell and serves it over HTTP.
+          # Routes:  GET  /ping  -> liveness info
+          #          POST /exec  -> body = command text, runs in the persistent shell
+          # Auth:    header X-FGI-Token must match -Token (when set)
+          # NOTE: the exit code is read on a SEPARATE line after the command, because
+          #       cmd.exe expands %errorlevel% when a line is parsed (a one-liner
+          #       'cmd & echo %errorlevel%' would report the PREVIOUS command's code).
+          param(
+              [string]$Token = '',
+              [int]$Port = 8442,
+              [string]$ShellPath = '',
+              [string]$ShellArgs = '',
+              [string]$ErrVar = '%errorlevel%'
+          )
+          $ErrorActionPreference = 'Continue'
+          if (-not $ShellPath) { $ShellPath = $env:ComSpec; $ShellArgs = '/q' }
+
+          # ---- listener (retry once with URL ACL in case http.sys refused) ----
+          $listener = New-Object System.Net.HttpListener
+          $listener.Prefixes.Add('http://+:' + $Port + '/')
+          try {
+              $listener.Start()
+          } catch {
+              Write-Host ('FGI agent: first bind failed (' + $_.Exception.Message + ') - adding URL ACL and retrying')
+              netsh http add urlacl url='http://+:' + $Port + '/' sddl='D:(A;;GX;;;WD)' | Out-Null
+              Start-Sleep -Seconds 1
+              $listener = New-Object System.Net.HttpListener
+              $listener.Prefixes.Add('http://+:' + $Port + '/')
+              $listener.Start()
+          }
+          Write-Host ('FGI agent listening on port ' + $Port)
+
+          # ---- the persistent shell process ----
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $ShellPath
+          $psi.Arguments = $ShellArgs
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardInput = $true
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.WorkingDirectory = $env:USERPROFILE
+          if (-not $psi.WorkingDirectory) { $psi.WorkingDirectory = (Get-Location).Path }
+          $proc = [System.Diagnostics.Process]::Start($psi)
+          if ($ErrVar -eq '%errorlevel%') { [void]$proc.StandardInput.WriteLine('@echo off') }
+
+          # ---- async output capture via dedicated reader runspaces (thread-safe;
+          #      avoids Register-ObjectEvent, whose actions are NOT pumped while
+          #      the request loop runs synchronously) ----
+          $outQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
+          $errQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
+          $readerScript = {
+              param($proc, $q, $which)
+              $reader = if ($which -eq 'out') { $proc.StandardOutput } else { $proc.StandardError }
+              try { while ($null -ne ($line = $reader.ReadLine())) { $q.Enqueue($line) } } catch {}
+          }
+          foreach ($which in 'out', 'err') {
+              $rs = [runspacefactory]::CreateRunspace()
+              $rs.Open()
+              $ps = [powershell]::Create()
+              $ps.Runspace = $rs
+              # Direct assignment - routing the queue through if-output would let the
+              # pipeline ENUMERATE (and empty) the ConcurrentQueue before binding it.
+              $target = $outQ; if ($which -eq 'err') { $target = $errQ }
+              [void]$ps.AddScript($readerScript).AddArgument($proc).AddArgument($target).AddArgument($which)
+              [void]$ps.BeginInvoke()
+          }
+
+          function Invoke-FgiCommand([string]$userCmd) {
+              $id = [guid]::NewGuid().ToString('N')
+              $marker = '__FGI_DONE_' + $id + '_'
+              [void]$proc.StandardInput.WriteLine($userCmd)
+              [void]$proc.StandardInput.WriteLine('echo ' + $marker + $ErrVar + '__')
+              $deadline = [DateTime]::UtcNow.AddSeconds(120)
+              $lines = New-Object System.Collections.Generic.List[string]
+              $code = ''
+              $done = $false
+              while ((-not $done) -and ([DateTime]::UtcNow -lt $deadline)) {
+                  $m = $null
+                  while ($outQ.TryDequeue([ref]$m)) {
+                      if ($m.Contains($marker)) {
+                          if ($m -match '_(\d+)__\s*$') { $code = $Matches[1] }
+                          $done = $true
+                          break
+                      }
+                      [void]$lines.Add($m)
+                  }
+                  if ($done) { break }
+                  $e = $null
+                  while ($errQ.TryDequeue([ref]$e)) { [void]$lines.Add('[stderr] ' + $e) }
+                  Start-Sleep -Milliseconds 50
+              }
+              if (-not $done) { $code = 'timeout' }
+              $body = ($lines -join [Environment]::NewLine)
+              if ($body.Length -gt 60000) { $body = '... (truncated) ...' + $body.Substring($body.Length - 60000) }
+              return '=== output ===' + [Environment]::NewLine + $body + [Environment]::NewLine + '=== FGI_EXIT=' + $code + ' ==='
+          }
+
+          # ---- request loop (serial by design: one shell, commands queue up) ----
+          while ($listener.IsListening) {
+              $ctx = $listener.GetContext()
+              $res = $ctx.Response
+              try {
+                  $req = $ctx.Request
+                  $tok = $req.Headers['X-FGI-Token']
+                  if ($Token -and ($tok -ne $Token)) {
+                      $res.StatusCode = 401
+                      $res.StatusDescription = 'bad token'
+                  }
+                  elseif ($req.HttpMethod -eq 'GET' -and $req.Url.AbsolutePath -eq '/ping') {
+                      $res.StatusCode = 200
+                      $body = 'host=' + $env:COMPUTERNAME + ' agent=ok port=' + $Port
+                      $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+                      $res.ContentLength64 = $bytes.Length
+                      $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                  }
+                  elseif ($req.HttpMethod -eq 'POST' -and $req.Url.AbsolutePath -eq '/exec') {
+                      $res.StatusCode = 200
+                      $reader = New-Object IO.StreamReader($req.InputStream, [Text.Encoding]::UTF8)
+                      $userCmd = $reader.ReadToEnd()
+                      $out = Invoke-FgiCommand $userCmd
+                      $bytes = [Text.Encoding]::UTF8.GetBytes($out)
+                      $res.ContentLength64 = $bytes.Length
+                      $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                  }
+                  else {
+                      $res.StatusCode = 404
+                      $res.StatusDescription = 'not found'
+                  }
+              } catch {
+                  try {
+                      $res.StatusCode = 500
+                      $msg = [Text.Encoding]::UTF8.GetBytes('agent error: ' + $_.Exception.Message)
+                      $res.ContentLength64 = $msg.Length
+                      $res.OutputStream.Write($msg, 0, $msg.Length)
+                  } catch {}
+              } finally {
+                  try { $res.Close() } catch {}
+              }
+          }
+          '@
+          $proc = Start-Process -FilePath 'powershell.exe' `
+            -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','C:\FGI\agent.ps1','-Token',$env:FGI_TOKEN `
+            -WindowStyle Hidden -RedirectStandardOutput 'C:\FGI\agent.log' -RedirectStandardError 'C:\FGI\agent.err.log' -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8442/ping' -Headers @{ 'X-FGI-Token' = $env:FGI_TOKEN } -TimeoutSec 3 -UseBasicParsing
+              if ($r.StatusCode -eq 200) { $ok = $true; break }
+            } catch { Start-Sleep -Seconds 2 }
+          }
+          if (-not $ok) {
+            Write-Host '--- agent.log ---';    Get-Content 'C:\FGI\agent.log'    -ErrorAction SilentlyContinue
+            Write-Host '--- agent.err.log ---'; Get-Content 'C:\FGI\agent.err.log' -ErrorAction SilentlyContinue
+            throw 'ROOT-CAUSE: FGI agent did not come up on port 8442.'
+          }
+          Write-Host 'FGI agent online (verify gate PASS).' -ForegroundColor Green
+
+      - name: Worker ${{ matrix.shard }} - optional boot command
+        if: ${{ inputs.boot_command != '' }}
+        shell: pwsh
+        run: |
+          $tok = $env:FGI_TOKEN
+          $cmd = '${{ inputs.boot_command }}'
+          try {
+            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8442/exec' -Method Post -Body $cmd `
+              -ContentType 'text/plain' -Headers @{ 'X-FGI-Token' = $tok } -TimeoutSec 150 -UseBasicParsing
+            Write-Host $r.Content
+          } catch { Write-Host ("boot command failed: " + $_.Exception.Message) -ForegroundColor Yellow }
+
+      - name: Worker ${{ matrix.shard }} - stay alive
+        shell: pwsh
+        run: |
+          $total = 340
+          try { $total = [int]'${{ inputs.keepalive_minutes }}' } catch {}
+          if ($total -le 0) { $total = 340 }
+          if ($total -gt 340) { $total = 340 }
+          Write-Host "Worker online for $total minutes - waiting for FGI commands." -ForegroundColor Green
+          for ($i = 1; $i -le $total; $i++) {
+            Start-Sleep -Seconds 60
+            if (($i % 5) -eq 0) { Write-Host "[$i/$total min] worker alive" -ForegroundColor Green }
+          }
