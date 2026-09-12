@@ -69,7 +69,6 @@ jobs:
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
       count: ${{ steps.mk.outputs.count }}
-      token: ${{ steps.tok.outputs.token }}
     steps:
       - name: Build worker matrix
         id: mk
@@ -93,20 +92,6 @@ jobs:
           echo "count=$n" >> "$GITHUB_OUTPUT"
           echo "Fleet: cockpit + $n worker(s)"
 
-      - name: Resolve fleet token
-        id: tok
-        shell: bash
-        env:
-          FGI_TOKEN_SECRET: ${{ secrets.FGI_TOKEN }}
-        run: |
-          if [ -n "$FGI_TOKEN_SECRET" ] && [ "$FGI_TOKEN_SECRET" != "CHANGE_ME_TO_RANDOM_TOKEN" ]; then
-            tok="$FGI_TOKEN_SECRET"
-          else
-            tok="fgi-$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
-          fi
-          echo "::add-mask::$tok"
-          echo "token=$tok" >> "$GITHUB_OUTPUT"
-
   # ================================================================
   # COCKPIT
   # ================================================================
@@ -117,7 +102,7 @@ jobs:
 
     env:
       WORKERS_EXPECTED: ${{ needs.setup.outputs.count }}
-      FGI_TOKEN: ${{ needs.setup.outputs.token }}
+      FGI_TOKEN_SECRET: ${{ secrets.FGI_TOKEN }}
 
     steps:
 
@@ -129,6 +114,40 @@ jobs:
           }
 
           Write-Host 'Tailscale auth key present.'
+
+      - name: Cockpit 0 - resolve fleet token
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $t = [string]$env:FGI_TOKEN_SECRET
+          $src = 'repository secret FGI_TOKEN'
+
+          if ([string]::IsNullOrWhiteSpace($t) -or $t -eq 'CHANGE_ME_TO_RANDOM_TOKEN') {
+            # No usable secret -> derive the same per-run token that the
+            # workers derives, locally. No cross-job handoff involved.
+            if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw 'ROOT-CAUSE: no FGI_TOKEN secret and TAILSCALE_AUTHKEY is empty - cannot derive a fleet token. Set the TAILSCALE_AUTHKEY repo secret (or your own FGI_TOKEN).'
+            }
+
+            $salt = "fgi-v1|$($env:TAILSCALE_AUTHKEY)|$($env:GITHUB_RUN_ID)|$($env:GITHUB_RUN_ATTEMPT)"
+
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+              $h = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($salt))
+            } finally {
+              $sha.Dispose()
+            }
+
+            $t = ([System.BitConverter]::ToString($h)) -replace '-', ''
+            $src = 'derived per-run from TAILSCALE_AUTHKEY (set an FGI_TOKEN secret to pin your own)'
+          }
+
+          Write-Output "::add-mask::$t"
+
+          Add-Content -Path $env:GITHUB_ENV -Value "FGI_TOKEN=$t"
+
+          Write-Host "Fleet token resolved. Source: $src" -ForegroundColor Green
 
       - name: Cockpit 1 - connect Tailscale
         uses: tailscale/github-action@v3
@@ -299,7 +318,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
 
           if ([string]::IsNullOrWhiteSpace($env:FGI_TOKEN)) {
-            throw 'ROOT-CAUSE: fleet token missing (setup job output).'
+            throw 'ROOT-CAUSE: fleet token missing in cockpit environment (token resolve step failed).'
           }
 
           New-Item -ItemType Directory -Path 'C:\FGI' -Force | Out-Null
@@ -468,28 +487,7 @@ jobs:
             $w = @(Get-FgiWorkers)
 
             if ($w.Count -eq 0) {
-              Write-Host 'No workers known. Running discovery...'
-              $w = @(Discover-FgiWorkers)
-            }
-
-            if ($w.Count -eq 0) {
-              Write-Host 'No workers found.' -ForegroundColor Yellow
-            } else {
-              $i = 0
-              foreach ($ip in $w) {
-                Write-Host ("[{0}] {1}" -f $i, $ip)
-                $i++
-              }
-            }
-
-            exit 0
-          }
-
-          if ($cmd -eq 'status') {
-            $w = @(Refresh-FgiWorkers)
-
-            if ($w.Count -eq 0) {
-              exit 0
+              Write-Host 'No workers known. Running discovery...           exit 0
             }
 
             foreach ($ip in $w) {
@@ -770,7 +768,7 @@ jobs:
 
     env:
       SHARD_INDEX: ${{ matrix.shard }}
-      FGI_TOKEN: ${{ needs.setup.outputs.token }}
+      FGI_TOKEN_SECRET: ${{ secrets.FGI_TOKEN }}
 
     steps:
 
@@ -782,6 +780,40 @@ jobs:
           }
 
           Write-Host 'Tailscale auth key present.'
+
+      - name: Worker - resolve fleet token
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $t = [string]$env:FGI_TOKEN_SECRET
+          $src = 'repository secret FGI_TOKEN'
+
+          if ([string]::IsNullOrWhiteSpace($t) -or $t -eq 'CHANGE_ME_TO_RANDOM_TOKEN') {
+            # No usable secret -> derive the same per-run token that the
+            # cockpit derives, locally. No cross-job handoff involved.
+            if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw 'ROOT-CAUSE: no FGI_TOKEN secret and TAILSCALE_AUTHKEY is empty - cannot derive a fleet token. Set the TAILSCALE_AUTHKEY repo secret (or your own FGI_TOKEN).'
+            }
+
+            $salt = "fgi-v1|$($env:TAILSCALE_AUTHKEY)|$($env:GITHUB_RUN_ID)|$($env:GITHUB_RUN_ATTEMPT)"
+
+            $sha = [System.Security.Cryptography.SHA256]::Create()
+            try {
+              $h = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($salt))
+            } finally {
+              $sha.Dispose()
+            }
+
+            $t = ([System.BitConverter]::ToString($h)) -replace '-', ''
+            $src = 'derived per-run from TAILSCALE_AUTHKEY (set an FGI_TOKEN secret to pin your own)'
+          }
+
+          Write-Output "::add-mask::$t"
+
+          Add-Content -Path $env:GITHUB_ENV -Value "FGI_TOKEN=$t"
+
+          Write-Host "Fleet token resolved. Source: $src" -ForegroundColor Green
 
       - name: Worker - connect Tailscale
         uses: tailscale/github-action@v3
@@ -1081,7 +1113,7 @@ jobs:
           '@ | Set-Content -Path 'C:\FGI\start-agent.ps1' -Encoding ascii
 
           if ([string]::IsNullOrWhiteSpace($env:FGI_TOKEN)) {
-            throw 'ROOT-CAUSE: fleet token missing on worker (setup job output).'
+            throw 'ROOT-CAUSE: fleet token missing on worker (token resolve step failed).'
           }
 
           & 'C:\FGI\start-agent.ps1' -Token $env:FGI_TOKEN
