@@ -1,14 +1,39 @@
 # =====================================================================
-# FGI Fleet - RDP cockpit + persistent worker CMD sessions
+# FGI Fleet - RDP cockpit + persistent worker CMD sessions  (FIXED)
 # Direct Tailscale discovery - NO GitHub worker registration
+# ---------------------------------------------------------------------
+# REQUIRED repository secret (Settings -> Secrets and variables -> Actions):
+#   TAILSCALE_AUTHKEY
+#       Reusable auth key from https://login.tailscale.com/admin/settings/keys
+#       An EPHEMERAL + REUSABLE key is recommended: one run joins
+#       1 cockpit + up to 18 workers, and ephemeral nodes clean
+#       themselves up when the run ends.
+#
+# OPTIONAL repository secrets (auto-generated per run when omitted):
+#   RDP_PASSWORD
+#       Windows password for 'runneradmin' and 'CynetAdmin'.
+#       If omitted, a strong random password is generated and printed
+#       in the cockpit log + step summary. Auto-display is meant for
+#       PRIVATE repos (public repo logs are readable by anyone).
+#   FGI_TOKEN
+#       Shared token between the cockpit client and worker agents.
+#       If omitted, a random per-run token is generated automatically.
+#
+# Notes:
+#  - One fleet at a time: a second run stays QUEUED until the live one
+#    finishes (duplicate 'mainy-w*' hostnames would break discovery).
+#  - GitHub-hosted jobs hard-stop at 6 h; keepalive is capped at 340
+#    minutes to leave room for setup. Windows runners burn minutes 2x.
+#  - FGI commands (from any CMD, cockpit or over RDP):
+#      FGI refresh | FGI status | FGI list
+#      FGI "cd work && py start.py"
 # =====================================================================
 
 name: FGI Fleet
 
 env:
-  # IMPORTANT: move these to GitHub Secrets for real use.
-  RDP_PASSWORD: 'CHANGE_ME'
-  FGI_TOKEN: 'CHANGE_ME_TO_RANDOM_TOKEN'
+  RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+  TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
 
 on:
   workflow_dispatch:
@@ -26,6 +51,10 @@ on:
         required: false
         default: ''
 
+concurrency:
+  group: fgi-fleet
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -40,12 +69,17 @@ jobs:
     outputs:
       matrix: ${{ steps.mk.outputs.matrix }}
       count: ${{ steps.mk.outputs.count }}
+      token: ${{ steps.tok.outputs.token }}
     steps:
       - name: Build worker matrix
         id: mk
         shell: bash
+        env:
+          SHARDS_IN: ${{ inputs.shards }}
         run: |
-          n=$(( ${{ inputs.shards || 3 }} ))
+          n="$(printf '%s' "$SHARDS_IN" | tr -cd '0-9')"
+          if [ -z "$n" ]; then n=3; fi
+          n=$(( 10#$n ))
           if [ "$n" -lt 0 ]; then n=0; fi
           if [ "$n" -gt 18 ]; then n=18; fi
 
@@ -59,6 +93,20 @@ jobs:
           echo "count=$n" >> "$GITHUB_OUTPUT"
           echo "Fleet: cockpit + $n worker(s)"
 
+      - name: Resolve fleet token
+        id: tok
+        shell: bash
+        env:
+          FGI_TOKEN_SECRET: ${{ secrets.FGI_TOKEN }}
+        run: |
+          if [ -n "$FGI_TOKEN_SECRET" ] && [ "$FGI_TOKEN_SECRET" != "CHANGE_ME_TO_RANDOM_TOKEN" ]; then
+            tok="$FGI_TOKEN_SECRET"
+          else
+            tok="fgi-$(python3 -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          fi
+          echo "::add-mask::$tok"
+          echo "token=$tok" >> "$GITHUB_OUTPUT"
+
   # ================================================================
   # COCKPIT
   # ================================================================
@@ -69,8 +117,18 @@ jobs:
 
     env:
       WORKERS_EXPECTED: ${{ needs.setup.outputs.count }}
+      FGI_TOKEN: ${{ needs.setup.outputs.token }}
 
     steps:
+
+      - name: Preflight - check Tailscale auth key
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw 'ROOT-CAUSE: TAILSCALE_AUTHKEY repository secret is not set. Create a reusable/ephemeral auth key at https://login.tailscale.com/admin/settings/keys and add it as a repo secret.'
+          }
+
+          Write-Host 'Tailscale auth key present.'
 
       - name: Cockpit 1 - connect Tailscale
         uses: tailscale/github-action@v3
@@ -90,7 +148,7 @@ jobs:
 
           $ip = $null
 
-          for ($i = 0; $i -lt 120; $i++) {
+          for ($i = 0; $i -lt 240; $i++) {
             $cand = ([string](& $tsExe ip -4 2>$null | Select-Object -First 1)).Trim()
 
             if ($cand -match '^100\.') {
@@ -98,14 +156,14 @@ jobs:
               break
             }
 
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Seconds 1
           }
 
           if (-not $ip) {
             throw 'ROOT-CAUSE: cockpit did not receive a Tailscale IPv4 address.'
           }
 
-          & $tsExe set --hostname=mainy 2>$null
+          & $tsExe set '--hostname=mainy' 2>$null
 
           Write-Host "Cockpit Tailscale IP: $ip" -ForegroundColor Green
 
@@ -114,14 +172,53 @@ jobs:
         run: |
           $ErrorActionPreference = 'Continue'
 
+          # --- resolve RDP password: secret or strong random fallback ---
+          $pw = [string]$env:RDP_PASSWORD
+          $generated = $false
+
+          if ([string]::IsNullOrWhiteSpace($pw) -or $pw -eq 'CHANGE_ME') {
+            $generated = $true
+
+            $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+            $bytes = New-Object byte[] 18
+            $rng.GetBytes($bytes)
+            $rng.Dispose()
+
+            $pw = 'Fg!' + (([Convert]::ToBase64String($bytes)) -replace '[^A-Za-z0-9]', 'x')
+
+            Add-Content -Path $env:GITHUB_ENV -Value "RDP_PW=$pw"
+            Add-Content -Path $env:GITHUB_ENV -Value 'RDP_PW_GENERATED=1'
+
+            Write-Host 'RDP_PASSWORD secret not set -> generated a strong random password (printed in the next steps).' -ForegroundColor Yellow
+          }
+
+          # --- relax local password policy so ANY password is accepted ---
+          # (VM is ephemeral and RDP is firewalled to the Tailscale range.)
+          $cfg = Join-Path $env:TEMP 'secpol.cfg'
+
+          secedit /export /cfg $cfg | Out-Null
+
+          if (Test-Path $cfg) {
+            (Get-Content $cfg) |
+              ForEach-Object { $_ -replace 'PasswordComplexity\s*=\s*1', 'PasswordComplexity = 0' } |
+              ForEach-Object { $_ -replace 'MinimumPasswordLength\s*=\s*\d+', 'MinimumPasswordLength = 0' } |
+              Set-Content -Path $cfg -Encoding ascii
+
+            secedit /configure /db "$env:windir\security\local.sdb" /cfg $cfg /areas SECURITYPOLICY | Out-Null
+            gpupdate /force | Out-Null
+          }
+
+          net accounts /minpwlen:0 | Out-Null
+
+          # --- enable RDP and tune the session ---
           $ts  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
           $rdp = "$ts\WinStations\RDP-Tcp"
           $pol = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
 
           New-Item -Path $pol -Force | Out-Null
 
-          Set-ItemProperty -Path $ts -Name fDenyTSConnections -Value 0
-          Set-ItemProperty -Path $rdp -Name UserAuthentication -Value 0 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $ts  -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path $rdp -Name UserAuthentication  -Value 0 -ErrorAction SilentlyContinue
           Set-ItemProperty -Path $pol -Name fCompressionEnabled -Type DWord -Value 1 -Force
 
           foreach ($n in 'fDisableWallpaper','fDisableFullWindowDrag','fDisableMenuAnims','fDisableThemes') {
@@ -133,16 +230,28 @@ jobs:
           powercfg /change standby-timeout-ac 0
           powercfg /change hibernate-timeout-ac 0
 
-          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          # --- (re)create the logon accounts ---
+          $secure = ConvertTo-SecureString $pw -AsPlainText -Force
 
           foreach ($name in 'runneradmin','CynetAdmin') {
-            if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) {
-              Set-LocalUser -Name $name -Password $pw
-            } else {
-              New-LocalUser -Name $name -Password $pw -PasswordNeverExpires -AccountNeverExpires
+            try {
+              if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) {
+                Set-LocalUser -Name $name -Password $secure -ErrorAction Stop
+                Set-LocalUser -Name $name -PasswordNeverExpires $true -ErrorAction SilentlyContinue
+              } else {
+                New-LocalUser -Name $name -Password $secure -PasswordNeverExpires -AccountNeverExpires -Description 'FGI RDP account' -ErrorAction Stop
+              }
+            } catch {
+              throw ("ROOT-CAUSE: Windows rejected the password for '{0}': {1}" -f $name, $_.Exception.Message)
             }
 
+            Enable-LocalUser -Name $name -ErrorAction SilentlyContinue
+
             net user $name /active:yes | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "ROOT-CAUSE: net user $name /active:yes failed (exit $LASTEXITCODE)"
+            }
+
             Add-LocalGroupMember -Group 'Administrators' -Member $name -ErrorAction SilentlyContinue
             Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $name -ErrorAction SilentlyContinue
           }
@@ -175,6 +284,13 @@ jobs:
             throw "ROOT-CAUSE: RDP not enabled (fDenyTSConnections=$deny)"
           }
 
+          $u1 = Get-LocalUser -Name 'runneradmin' -ErrorAction SilentlyContinue
+          $u2 = Get-LocalUser -Name 'CynetAdmin' -ErrorAction SilentlyContinue
+
+          if (-not $u1 -or -not $u2) {
+            throw 'ROOT-CAUSE: RDP accounts missing after setup (runneradmin / CynetAdmin).'
+          }
+
           Write-Host 'Cockpit RDP ready.' -ForegroundColor Green
 
       - name: Cockpit 4 - install FGI client
@@ -182,17 +298,20 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
 
+          if ([string]::IsNullOrWhiteSpace($env:FGI_TOKEN)) {
+            throw 'ROOT-CAUSE: fleet token missing (setup job output).'
+          }
+
           New-Item -ItemType Directory -Path 'C:\FGI' -Force | Out-Null
 
-          $fgiCmd = @'
+          @'
           @echo off
           setlocal
           powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\FGI\fgi.ps1" %*
           exit /b %errorlevel%
-          '@
-          $fgiCmd | Set-Content -Path 'C:\FGI\fgi.cmd' -Encoding ascii
+          '@ | Set-Content -Path 'C:\FGI\fgi.cmd' -Encoding ascii
 
-          $fgiPs1 = @'
+          @'
           param(
             [Parameter(ValueFromRemainingArguments = $true)]
             [string[]]$Rest
@@ -250,7 +369,7 @@ jobs:
                     $name = [string]$peer.DNSName
                   }
 
-                  if ($name -match '^mainy-w\d+$') {
+                  if ($name -match '^mainy-w\d+(\.|$)') {
                     $ip = @($peer.TailscaleIPs) |
                       Where-Object { $_ -match '^100\.' } |
                       Select-Object -First 1
@@ -278,12 +397,7 @@ jobs:
 
           function Test-FgiWorker([string]$ip) {
             try {
-              $null = Invoke-WebRequest `
-                -Uri ("http://{0}:8442/ping" -f $ip) `
-                -Headers @{ 'X-FGI-Token' = $token } `
-                -TimeoutSec 5 `
-                -UseBasicParsing
-
+              $null = Invoke-WebRequest -Uri ("http://{0}:8442/ping" -f $ip) -Headers @{ 'X-FGI-Token' = $token } -TimeoutSec 5 -UseBasicParsing
               return $true
             } catch {
               return $false
@@ -291,8 +405,8 @@ jobs:
           }
 
           function Refresh-FgiWorkers {
-            # Always rediscover first. This is the important fix:
-            # worker discovery no longer depends on GitHub commits.
+            # Always rediscover first. Worker discovery no longer
+            # depends on GitHub commits.
             $all = @(Discover-FgiWorkers)
 
             if ($all.Count -eq 0) {
@@ -380,11 +494,7 @@ jobs:
 
             foreach ($ip in $w) {
               try {
-                $r = Invoke-WebRequest `
-                  -Uri ("http://{0}:8442/ping" -f $ip) `
-                  -Headers @{ 'X-FGI-Token' = $token } `
-                  -TimeoutSec 8 `
-                  -UseBasicParsing
+                $r = Invoke-WebRequest -Uri ("http://{0}:8442/ping" -f $ip) -Headers @{ 'X-FGI-Token' = $token } -TimeoutSec 8 -UseBasicParsing
 
                 Write-Host ("[{0}] ONLINE {1}" -f $ip, $r.Content) -ForegroundColor Green
               } catch {
@@ -415,14 +525,7 @@ jobs:
             Write-Host ("=== [{0}/{1}] {2} ===" -f $i, $w.Count, $ip) -ForegroundColor Cyan
 
             try {
-              $r = Invoke-WebRequest `
-                -Uri ("http://{0}:8442/exec" -f $ip) `
-                -Method Post `
-                -Body $cmd `
-                -ContentType 'text/plain; charset=utf-8' `
-                -Headers @{ 'X-FGI-Token' = $token } `
-                -TimeoutSec 150 `
-                -UseBasicParsing
+              $r = Invoke-WebRequest -Uri ("http://{0}:8442/exec" -f $ip) -Method Post -Body $cmd -ContentType 'text/plain; charset=utf-8' -Headers @{ 'X-FGI-Token' = $token } -TimeoutSec 150 -UseBasicParsing
 
               Write-Host $r.Content
 
@@ -444,8 +547,7 @@ jobs:
 
           Write-Host ('--- done: ' + ($w.Count - $fail) + ' ok, ' + $fail + ' failed ---') -ForegroundColor Yellow
           exit 1
-          '@
-          $fgiPs1 | Set-Content -Path 'C:\FGI\fgi.ps1' -Encoding ascii
+          '@ | Set-Content -Path 'C:\FGI\fgi.ps1' -Encoding ascii
 
           Set-Content -Path 'C:\FGI\token.txt' -Value $env:FGI_TOKEN -Encoding ascii
           Set-Content -Path 'C:\FGI\workers.txt' -Value '' -Encoding ascii
@@ -455,6 +557,7 @@ jobs:
             [Environment]::SetEnvironmentVariable('Path', $machinePath + ';C:\FGI', 'Machine')
           }
 
+          New-Item -ItemType Directory -Path 'C:\Users\CynetAdmin\Desktop' -Force | Out-Null
           Copy-Item 'C:\FGI\fgi.cmd' 'C:\Users\CynetAdmin\Desktop\FGI.cmd' -Force -ErrorAction SilentlyContinue
 
           Write-Host 'FGI client installed.' -ForegroundColor Green
@@ -469,7 +572,9 @@ jobs:
 
           Write-Host "Waiting for $expected worker(s)..."
 
-          for ($attempt = 1; $attempt -le 90; $attempt++) {
+          # Phase 1: wait until the expected number of mainy-w* peers
+          # shows up on the tailnet.
+          for ($attempt = 1; $attempt -le 200; $attempt++) {
             try {
               $obj = & $tsExe status --json 2>$null | ConvertFrom-Json
               $count = 0
@@ -485,7 +590,7 @@ jobs:
                     $name = [string]$peer.DNSName
                   }
 
-                  if ($name -match '^mainy-w\d+$') {
+                  if ($name -match '^mainy-w\d+(\.|$)') {
                     $ip = @($peer.TailscaleIPs) |
                       Where-Object { $_ -match '^100\.' } |
                       Select-Object -First 1
@@ -497,7 +602,7 @@ jobs:
                 }
               }
 
-              Write-Host "[$attempt/90] discovered workers: $count / $expected"
+              Write-Host "[$attempt/200] discovered workers: $count / $expected"
 
               if ($expected -eq 0 -or $count -ge $expected) {
                 break
@@ -506,7 +611,66 @@ jobs:
               Write-Host ('Discovery error: ' + $_.Exception.Message) -ForegroundColor Yellow
             }
 
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 3
+          }
+
+          # Phase 2: confirm the worker agents actually answer /ping.
+          # Guards against stale mainy-w* devices from older runs.
+          if ($expected -gt 0) {
+            Write-Host 'Confirming worker agents answer /ping...'
+
+            for ($p = 1; $p -le 60; $p++) {
+              $ips = @()
+
+              try {
+                $obj = & $tsExe status --json 2>$null | ConvertFrom-Json
+
+                if ($obj.Peer) {
+                  foreach ($property in $obj.Peer.PSObject.Properties) {
+                    $peer = $property.Value
+
+                    $name = ''
+                    if ($peer.HostName) {
+                      $name = [string]$peer.HostName
+                    } elseif ($peer.DNSName) {
+                      $name = [string]$peer.DNSName
+                    }
+
+                    if ($name -match '^mainy-w\d+(\.|$)') {
+                      $ip = @($peer.TailscaleIPs) |
+                        Where-Object { $_ -match '^100\.' } |
+                        Select-Object -First 1
+
+                      if ($ip) {
+                        $ips += $ip
+                      }
+                    }
+                  }
+                }
+              } catch {}
+
+              $ips = @($ips | Select-Object -Unique)
+              $alive = 0
+
+              foreach ($ip in $ips) {
+                try {
+                  $null = Invoke-WebRequest -Uri ("http://{0}:8442/ping" -f $ip) -Headers @{ 'X-FGI-Token' = $env:FGI_TOKEN } -TimeoutSec 4 -UseBasicParsing
+                  $alive++
+                } catch {}
+              }
+
+              Write-Host ("[confirm {0}/60] agents alive: {1} / {2}" -f $p, $alive, $expected)
+
+              if ($alive -ge $expected) {
+                break
+              }
+
+              Start-Sleep -Seconds 5
+            }
+
+            if ($alive -lt $expected) {
+              Write-Host ("Only $alive of $expected worker agent(s) answered. Continuing anyway - FGI refresh/status will show live state.") -ForegroundColor Yellow
+            }
           }
 
           Write-Host 'Worker discovery wait finished.' -ForegroundColor Green
@@ -518,21 +682,36 @@ jobs:
           $ip = ([string](& $tsExe ip -4 2>$null | Select-Object -First 1)).Trim()
 
           if ($ip -notmatch '^100\.') {
-            throw "Could not resolve cockpit Tailscale IP."
+            throw 'Could not resolve cockpit Tailscale IP.'
+          }
+
+          $user = 'CynetAdmin'
+          $pwLine = ''
+          $pwSummary = ''
+
+          if ($env:RDP_PW_GENERATED -eq '1') {
+            $pwLine = "# PASSWORD:    $($env:RDP_PW)   (auto-generated - RDP_PASSWORD secret was not set)"
+            $pwSummary = "| **PASSWORD** | ``$($env:RDP_PW)`` *(auto-generated)* |"
           }
 
           Write-Host '################################################' -ForegroundColor Magenta
           Write-Host "# RDP ADDRESS: $ip" -ForegroundColor Magenta
           Write-Host "# COMMAND:     mstsc /v:$ip" -ForegroundColor Magenta
-          Write-Host '# USER:        CynetAdmin' -ForegroundColor Magenta
+          Write-Host "# USER:        $user" -ForegroundColor Magenta
+          if ($pwLine) { Write-Host $pwLine -ForegroundColor Magenta }
           Write-Host '################################################' -ForegroundColor Magenta
 
-          @(
+          $lines = @(
             '### FGI Fleet online',
             '',
             "| **RDP ADDRESS** | ``$ip`` |",
             "| **Connect** | ``mstsc /v:$ip`` |",
-            '| **User** | ``CynetAdmin`` |',
+            "| **User** | ``$user`` |"
+          )
+
+          if ($pwSummary) { $lines += $pwSummary }
+
+          $lines += @(
             '| **FGI** | ``C:\FGI\fgi.cmd`` |',
             '',
             'Test:',
@@ -542,16 +721,18 @@ jobs:
             'FGI status',
             'FGI "cd work && py start.py"',
             '```'
-          ) >> $env:GITHUB_STEP_SUMMARY
+          )
+
+          ($lines -join "`n") | Add-Content -Path $env:GITHUB_STEP_SUMMARY
 
       - name: Cockpit 7 - keep session alive
         shell: pwsh
+        env:
+          KEEPALIVE_MIN: ${{ inputs.keepalive_minutes }}
         run: |
           $total = 340
 
-          try {
-            $total = [int]'${{ inputs.keepalive_minutes }}'
-          } catch {}
+          try { $total = [int]$env:KEEPALIVE_MIN } catch {}
 
           if ($total -le 0) { $total = 340 }
           if ($total -gt 340) { $total = 340 }
@@ -563,6 +744,12 @@ jobs:
 
             if (($i % 5) -eq 0) {
               Write-Host "[$i/$total min] cockpit running" -ForegroundColor Green
+            }
+
+            # Re-run discovery every 10 minutes so late-joining or
+            # restarted workers are picked up automatically.
+            if (($i % 10) -eq 0) {
+              try { $null = & 'C:\FGI\fgi.cmd' refresh } catch {}
             }
           }
 
@@ -583,8 +770,18 @@ jobs:
 
     env:
       SHARD_INDEX: ${{ matrix.shard }}
+      FGI_TOKEN: ${{ needs.setup.outputs.token }}
 
     steps:
+
+      - name: Preflight - check Tailscale auth key
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw 'ROOT-CAUSE: TAILSCALE_AUTHKEY repository secret is not set. Create a reusable/ephemeral auth key at https://login.tailscale.com/admin/settings/keys and add it as a repo secret.'
+          }
+
+          Write-Host 'Tailscale auth key present.'
 
       - name: Worker - connect Tailscale
         uses: tailscale/github-action@v3
@@ -605,7 +802,7 @@ jobs:
 
           $ip = $null
 
-          for ($i = 0; $i -lt 120; $i++) {
+          for ($i = 0; $i -lt 240; $i++) {
             $cand = ([string](& $tsExe ip -4 2>$null | Select-Object -First 1)).Trim()
 
             if ($cand -match '^100\.') {
@@ -613,7 +810,7 @@ jobs:
               break
             }
 
-            Start-Sleep -Milliseconds 500
+            Start-Sleep -Seconds 1
           }
 
           if (-not $ip) {
@@ -633,7 +830,7 @@ jobs:
 
           New-Item -ItemType Directory -Path 'C:\FGI' -Force | Out-Null
 
-          $rules = @{
+          $rule = @{
             DisplayName   = 'FGI Agent 8442'
             Direction     = 'Inbound'
             Protocol      = 'TCP'
@@ -644,11 +841,11 @@ jobs:
           }
 
           Remove-NetFirewallRule -DisplayName 'FGI Agent 8442' -ErrorAction SilentlyContinue
-          New-NetFirewallRule @rules | Out-Null
+          New-NetFirewallRule @rule | Out-Null
 
           netsh http add urlacl url=http://+:8442/ sddl='D:(A;;GX;;;WD)' 2>$null | Out-Null
 
-          $agentPs1 = @'
+          @'
           param(
             [string]$Token = '',
             [int]$Port = 8442
@@ -673,22 +870,9 @@ jobs:
           Write-Host ("FGI agent listening on port {0}" -f $Port)
 
           # One persistent cmd.exe for the lifetime of the worker.
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = $env:ComSpec
-          $psi.Arguments = '/q'
-          $psi.UseShellExecute = $false
-          $psi.CreateNoWindow = $true
-          $psi.RedirectStandardInput = $true
-          $psi.RedirectStandardOutput = $true
-          $psi.RedirectStandardError = $true
-          $psi.WorkingDirectory = $env:USERPROFILE
-
-          $proc = [System.Diagnostics.Process]::Start($psi)
-
-          [void]$proc.StandardInput.WriteLine('@echo off')
-
-          $outQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
-          $errQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
+          $script:proc = $null
+          $script:outQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
+          $script:errQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
 
           $readerScript = {
             param($proc, $queue, $which)
@@ -706,28 +890,66 @@ jobs:
             } catch {}
           }
 
-          foreach ($which in @('out','err')) {
-            $rs = [runspacefactory]::CreateRunspace()
-            $rs.Open()
+          function Start-FgiShell {
+            if ($script:proc -and (-not $script:proc.HasExited)) { return }
 
-            $ps = [powershell]::Create()
-            $ps.Runspace = $rs
+            $script:outQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
+            $script:errQ = New-Object System.Collections.Concurrent.ConcurrentQueue[string]
 
-            $target = $outQ
-            if ($which -eq 'err') {
-              $target = $errQ
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $env:ComSpec
+            $psi.Arguments = '/q'
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.RedirectStandardInput = $true
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.WorkingDirectory = $env:USERPROFILE
+
+            $script:proc = [System.Diagnostics.Process]::Start($psi)
+
+            [void]$script:proc.StandardInput.WriteLine('@echo off')
+
+            foreach ($which in @('out','err')) {
+              $rs = [runspacefactory]::CreateRunspace()
+              $rs.Open()
+
+              $ps = [powershell]::Create()
+              $ps.Runspace = $rs
+
+              $target = $script:outQ
+              if ($which -eq 'err') {
+                $target = $script:errQ
+              }
+
+              [void]$ps.AddScript($readerScript).AddArgument($script:proc).AddArgument($target).AddArgument($which)
+              [void]$ps.BeginInvoke()
             }
 
-            [void]$ps.AddScript($readerScript).AddArgument($proc).AddArgument($target).AddArgument($which)
-            [void]$ps.BeginInvoke()
+            Write-Host 'FGI shell (cmd.exe) started.'
           }
 
+          Start-FgiShell
+
           function Invoke-FgiCommand([string]$userCmd) {
+            Start-FgiShell
+
             $id = [guid]::NewGuid().ToString('N')
             $marker = "__FGI_DONE_${id}_"
 
-            [void]$proc.StandardInput.WriteLine($userCmd)
-            [void]$proc.StandardInput.WriteLine("echo $marker%errorlevel%__")
+            $send = {
+              [void]$script:proc.StandardInput.WriteLine($userCmd)
+              [void]$script:proc.StandardInput.WriteLine("echo $marker%errorlevel%__")
+            }
+
+            try {
+              & $send
+            } catch {
+              # Shell died (e.g. someone ran "exit") -> respawn and retry once.
+              $script:proc = $null
+              Start-FgiShell
+              & $send
+            }
 
             $deadline = [DateTime]::UtcNow.AddSeconds(145)
             $lines = New-Object System.Collections.Generic.List[string]
@@ -737,7 +959,7 @@ jobs:
             while ((-not $done) -and ([DateTime]::UtcNow -lt $deadline)) {
               $m = $null
 
-              while ($outQ.TryDequeue([ref]$m)) {
+              while ($script:outQ.TryDequeue([ref]$m)) {
                 if ($m.Contains($marker)) {
                   if ($m -match "${id}_([0-9]+)__\s*$") {
                     $code = $Matches[1]
@@ -745,6 +967,11 @@ jobs:
 
                   $done = $true
                   break
+                }
+
+                if ($m -match '__FGI_DONE_[0-9a-f]{32}_\d+__') {
+                  # Stale marker from an earlier command that timed out.
+                  continue
                 }
 
                 [void]$lines.Add($m)
@@ -756,7 +983,7 @@ jobs:
 
               $e = $null
 
-              while ($errQ.TryDequeue([ref]$e)) {
+              while ($script:errQ.TryDequeue([ref]$e)) {
                 [void]$lines.Add('[stderr] ' + $e)
               }
 
@@ -832,40 +1059,38 @@ jobs:
               try { $res.Close() } catch {}
             }
           }
-          '@
-          $agentPs1 | Set-Content -Path 'C:\FGI\agent.ps1' -Encoding ascii
+          '@ | Set-Content -Path 'C:\FGI\agent.ps1' -Encoding ascii
 
-          if ($env:FGI_TOKEN -eq 'CHANGE_ME_TO_RANDOM_TOKEN') {
-            throw 'Set a real FGI_TOKEN before running the workflow.'
+          @'
+          param([string]$Token)
+
+          $ErrorActionPreference = 'Continue'
+
+          $old = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+            Where-Object {
+              ($_.CommandLine -match 'FGI\\agent\.ps1') -and ($_.ProcessId -ne $PID)
+            }
+
+          foreach ($o in $old) {
+            try { Stop-Process -Id $o.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
           }
 
-          $startArgs = @(
-            '-NoProfile'
-            '-ExecutionPolicy'
-            'Bypass'
-            '-File'
-            'C:\FGI\agent.ps1'
-            '-Token'
-            $env:FGI_TOKEN
-          )
+          Start-Sleep -Milliseconds 300
 
-          $proc = Start-Process `
-            -FilePath 'powershell.exe' `
-            -ArgumentList $startArgs `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput 'C:\FGI\agent.log' `
-            -RedirectStandardError 'C:\FGI\agent.err.log' `
-            -PassThru
+          Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File','C:\FGI\agent.ps1','-Token',$Token) -WindowStyle Hidden -RedirectStandardOutput 'C:\FGI\agent.log' -RedirectStandardError 'C:\FGI\agent.err.log'
+          '@ | Set-Content -Path 'C:\FGI\start-agent.ps1' -Encoding ascii
+
+          if ([string]::IsNullOrWhiteSpace($env:FGI_TOKEN)) {
+            throw 'ROOT-CAUSE: fleet token missing on worker (setup job output).'
+          }
+
+          & 'C:\FGI\start-agent.ps1' -Token $env:FGI_TOKEN
 
           $ok = $false
 
           for ($i = 0; $i -lt 30; $i++) {
             try {
-              $r = Invoke-WebRequest `
-                -Uri 'http://127.0.0.1:8442/ping' `
-                -Headers @{ 'X-FGI-Token' = $env:FGI_TOKEN } `
-                -TimeoutSec 3 `
-                -UseBasicParsing
+              $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8442/ping' -Headers @{ 'X-FGI-Token' = $env:FGI_TOKEN } -TimeoutSec 3 -UseBasicParsing
 
               if ($r.StatusCode -eq 200) {
                 $ok = $true
@@ -891,20 +1116,13 @@ jobs:
       - name: Worker - optional boot command
         if: ${{ inputs.boot_command != '' }}
         shell: pwsh
+        env:
+          BOOT_CMD: ${{ inputs.boot_command }}
         run: |
-          $cmd = @'
-          ${{ inputs.boot_command }}
-          '@
+          $cmd = [string]$env:BOOT_CMD
 
           try {
-            $r = Invoke-WebRequest `
-              -Uri 'http://127.0.0.1:8442/exec' `
-              -Method Post `
-              -Body $cmd `
-              -ContentType 'text/plain; charset=utf-8' `
-              -Headers @{ 'X-FGI-Token' = $env:FGI_TOKEN } `
-              -TimeoutSec 150 `
-              -UseBasicParsing
+            $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8442/exec' -Method Post -Body $cmd -ContentType 'text/plain; charset=utf-8' -Headers @{ 'X-FGI-Token' = $env:FGI_TOKEN } -TimeoutSec 150 -UseBasicParsing
 
             Write-Host $r.Content
           } catch {
@@ -913,12 +1131,12 @@ jobs:
 
       - name: Worker - stay alive
         shell: pwsh
+        env:
+          KEEPALIVE_MIN: ${{ inputs.keepalive_minutes }}
         run: |
           $total = 340
 
-          try {
-            $total = [int]'${{ inputs.keepalive_minutes }}'
-          } catch {}
+          try { $total = [int]$env:KEEPALIVE_MIN } catch {}
 
           if ($total -le 0) { $total = 340 }
           if ($total -gt 340) { $total = 340 }
@@ -930,5 +1148,18 @@ jobs:
 
             if (($i % 5) -eq 0) {
               Write-Host "[$i/$total min] worker $env:SHARD_INDEX alive" -ForegroundColor Green
+
+              # Watchdog: if the local agent died, restart it.
+              $alive = $false
+              try {
+                $r = Invoke-WebRequest -Uri 'http://127.0.0.1:8442/ping' -Headers @{ 'X-FGI-Token' = $env:FGI_TOKEN } -TimeoutSec 5 -UseBasicParsing
+                $alive = ($r.StatusCode -eq 200)
+              } catch {}
+
+              if (-not $alive) {
+                Write-Host 'FGI agent down -> restarting.' -ForegroundColor Yellow
+                try { & 'C:\FGI\start-agent.ps1' -Token $env:FGI_TOKEN } catch {}
+                Start-Sleep -Seconds 5
+              }
             }
           }
