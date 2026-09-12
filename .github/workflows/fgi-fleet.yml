@@ -69,7 +69,6 @@ jobs:
 
     env:
       WORKERS_EXPECTED: ${{ needs.setup.outputs.count }}
-      FGI_TOKEN: ${{ env.FGI_TOKEN }}
 
     steps:
 
@@ -185,14 +184,15 @@ jobs:
 
           New-Item -ItemType Directory -Path 'C:\FGI' -Force | Out-Null
 
-          @'
+          $fgiCmd = @'
           @echo off
           setlocal
           powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\FGI\fgi.ps1" %*
           exit /b %errorlevel%
-          '@ | Set-Content -Path 'C:\FGI\fgi.cmd' -Encoding ascii
+          '@
+          $fgiCmd | Set-Content -Path 'C:\FGI\fgi.cmd' -Encoding ascii
 
-          @'
+          $fgiPs1 = @'
           param(
             [Parameter(ValueFromRemainingArguments = $true)]
             [string[]]$Rest
@@ -444,7 +444,8 @@ jobs:
 
           Write-Host ('--- done: ' + ($w.Count - $fail) + ' ok, ' + $fail + ' failed ---') -ForegroundColor Yellow
           exit 1
-          '@ | Set-Content -Path 'C:\FGI\fgi.ps1' -Encoding ascii
+          '@
+          $fgiPs1 | Set-Content -Path 'C:\FGI\fgi.ps1' -Encoding ascii
 
           Set-Content -Path 'C:\FGI\token.txt' -Value $env:FGI_TOKEN -Encoding ascii
           Set-Content -Path 'C:\FGI\workers.txt' -Value '' -Encoding ascii
@@ -582,7 +583,6 @@ jobs:
 
     env:
       SHARD_INDEX: ${{ matrix.shard }}
-      FGI_TOKEN: ${{ env.FGI_TOKEN }}
 
     steps:
 
@@ -648,7 +648,7 @@ jobs:
 
           netsh http add urlacl url=http://+:8442/ sddl='D:(A;;GX;;;WD)' 2>$null | Out-Null
 
-          @'
+          $agentPs1 = @'
           param(
             [string]$Token = '',
             [int]$Port = 8442
@@ -832,7 +832,8 @@ jobs:
               try { $res.Close() } catch {}
             }
           }
-          '@ | Set-Content -Path 'C:\FGI\agent.ps1' -Encoding ascii
+          '@
+          $agentPs1 | Set-Content -Path 'C:\FGI\agent.ps1' -Encoding ascii
 
           if ($env:FGI_TOKEN -eq 'CHANGE_ME_TO_RANDOM_TOKEN') {
             throw 'Set a real FGI_TOKEN before running the workflow.'
