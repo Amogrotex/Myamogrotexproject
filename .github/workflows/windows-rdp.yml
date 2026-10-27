@@ -212,6 +212,9 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # Native commands are checked explicitly below so expected registry access
+          # failures can be logged as warnings without failing the entire workflow.
+          $PSNativeCommandUseErrorActionPreference = $false
           $wallpaperUrl  = 'https://4kwallpapers.com/images/walls/thumbs_2t/27235.jpg'
           $wallpaperPath = 'C:\Users\Public\Pictures\anime-wallpaper.jpg'
           New-Item -ItemType Directory -Path (Split-Path $wallpaperPath) -Force | Out-Null
@@ -260,42 +263,73 @@ jobs:
             }
           }
 
-          # Seed the default profile so CynetAdmin gets these settings at first RDP sign-in.
-          $defaultHive = 'C:\Users\Default\NTUSER.DAT'
-          if (-not (Test-Path $defaultHive)) { throw "Default Windows profile hive not found: $defaultHive" }
-          & reg.exe load 'HKU\RdpDesktopDefault' $defaultHive | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw 'Could not load the default Windows profile hive.' }
-          try {
-            Set-RdpDesktopDefaults -Root 'Registry::HKEY_USERS\RdpDesktopDefault' -SetWallpaper:$wallpaperReady
-          } finally {
-            & reg.exe unload 'HKU\RdpDesktopDefault' | Out-Null
+          function Invoke-RegCommand {
+            param([string[]]$RegArgs, [string]$Operation)
+            try {
+              $output = & reg.exe @RegArgs 2>&1
+              $code = $LASTEXITCODE
+              if ($code -ne 0) {
+                $detail = ($output | Out-String).Trim()
+                Write-Host "$Operation failed (reg.exe exit $code): $detail" -ForegroundColor Yellow
+                return $false
+              }
+              return $true
+            } catch {
+              Write-Host "$Operation failed: $($_.Exception.Message)" -ForegroundColor Yellow
+              return $false
+            }
           }
 
-          # Also apply the settings to profiles that already exist (for example runneradmin).
-          foreach ($userName in 'CynetAdmin','runneradmin') {
-            $account = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
-            if (-not $account) { continue }
-            $sid = $account.SID.Value
-            $profile = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $profile -or -not $profile.LocalPath) { continue }
-            $ntuser = Join-Path $profile.LocalPath 'NTUSER.DAT'
-            if (-not (Test-Path $ntuser)) { continue }
+          # Seed the default profile so CynetAdmin gets these settings at first RDP sign-in.
+          $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+          if (Test-Path $defaultHive) {
+            $defaultLoaded = Invoke-RegCommand -RegArgs @('load', 'HKU\RdpDesktopDefault', $defaultHive) -Operation 'Loading default profile hive'
+            if ($defaultLoaded) {
+              try {
+                Set-RdpDesktopDefaults -Root 'Registry::HKEY_USERS\RdpDesktopDefault' -SetWallpaper:$wallpaperReady
+              } catch {
+                Write-Host ('Could not set default desktop preferences: ' + $_.Exception.Message) -ForegroundColor Yellow
+              } finally {
+                $null = Invoke-RegCommand -RegArgs @('unload', 'HKU\RdpDesktopDefault') -Operation 'Unloading default profile hive'
+              }
+            }
+          } else {
+            Write-Host "Default profile hive not found at $defaultHive; skipping default-profile customization." -ForegroundColor Yellow
+          }
 
-            if ($profile.Loaded) {
-              Set-RdpDesktopDefaults -Root "Registry::HKEY_USERS\$sid" -SetWallpaper:$wallpaperReady
-            } else {
-              $hiveKey = 'RdpDesktop_' + ($sid -replace '[^A-Za-z0-9_]', '_')
-              $hiveMount = "HKU\$hiveKey"
-              & reg.exe load $hiveMount $ntuser | Out-Null
-              if ($LASTEXITCODE -eq 0) {
+          # Also update existing account profiles when Windows allows their hives to be opened.
+          foreach ($userName in 'CynetAdmin','runneradmin') {
+            try {
+              $account = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+              if (-not $account) { continue }
+              $sid = $account.SID.Value
+              $profile = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue | Select-Object -First 1
+              if (-not $profile -or -not $profile.LocalPath) { continue }
+              $ntuser = Join-Path $profile.LocalPath 'NTUSER.DAT'
+              if (-not (Test-Path $ntuser)) { continue }
+
+              if ($profile.Loaded) {
                 try {
-                  Set-RdpDesktopDefaults -Root "Registry::HKEY_USERS\$hiveKey" -SetWallpaper:$wallpaperReady
-                } finally {
-                  & reg.exe unload $hiveMount | Out-Null
+                  Set-RdpDesktopDefaults -Root "Registry::HKEY_USERS\$sid" -SetWallpaper:$wallpaperReady
+                } catch {
+                  Write-Host "Could not update loaded profile for $userName; continuing: $($_.Exception.Message)" -ForegroundColor Yellow
                 }
               } else {
-                Write-Host "Could not load existing profile for $userName; default-profile settings remain in place." -ForegroundColor Yellow
+                $hiveKey = 'RdpDesktop_' + ($sid -replace '[^A-Za-z0-9_]', '_')
+                $hiveMount = "HKU\$hiveKey"
+                $loaded = Invoke-RegCommand -RegArgs @('load', $hiveMount, $ntuser) -Operation "Loading profile for $userName"
+                if ($loaded) {
+                  try {
+                    Set-RdpDesktopDefaults -Root "Registry::HKEY_USERS\$hiveKey" -SetWallpaper:$wallpaperReady
+                  } catch {
+                    Write-Host "Could not set desktop preferences for $userName; continuing: $($_.Exception.Message)" -ForegroundColor Yellow
+                  } finally {
+                    $null = Invoke-RegCommand -RegArgs @('unload', $hiveMount) -Operation "Unloading profile for $userName"
+                  }
+                }
               }
+            } catch {
+              Write-Host "Desktop customization for $userName was skipped: $($_.Exception.Message)" -ForegroundColor Yellow
             }
           }
 
@@ -312,6 +346,10 @@ jobs:
               Remove-Item -Force -ErrorAction SilentlyContinue
           }
           Write-Host 'Desktop configured: dark theme, wallpaper (when downloadable), This PC icon; no fgi or PowerShell files are placed on the desktop.' -ForegroundColor Green
+          # The runner treats a non-zero exit code from the last native command as a failed step.
+          # All optional native-command errors above are handled; end this setup step successfully.
+          $global:LASTEXITCODE = 0
+          exit 0
 
       # -------------------------------------------------------------
       # 3. PUBLISH connection info (IP only - never the password)
