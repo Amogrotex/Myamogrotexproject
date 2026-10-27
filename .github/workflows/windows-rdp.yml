@@ -5,9 +5,7 @@
 # failure points, strictly ASCII (safe for Windows PowerShell).
 #
 # WHAT CHANGED vs v4
-#   * SECURITY FIX: password no longer hardcoded ("Cynet@2026" was in a
-#     PUBLIC file + printed into PUBLIC job summaries). It now comes from
-#     the repo secret RDP_PASSWORD. Fail-fast if the secret is missing.
+#   * RDP password is hard-coded as a PowerShell string in the RDP setup step.
 #   * SPEED: official tailscale/github-action@v3 (cached binaries) runs
 #     as the FIRST real step; RDP config is local-only, so the session
 #     is reachable in well under a minute.
@@ -16,25 +14,19 @@
 #     time with a safety margin.
 #   * NLA is ON by default (faster auth + safer). Input `nla: false`
 #     restores the old behavior for legacy clients.
-#   * CONNECTION QUALITY: direct-vs-relay check logged every 5 minutes.
+#   * CONNECTION QUALITY: optional Tailscale RTT/path check to the client.
+#   * DESKTOP: dark theme, requested wallpaper, and This PC icon by default.
+#   * CLEANUP: helper scripts are not downloaded to the desktop.
 #
 # REQUIRED SETUP:
 #   TAILSCALE_AUTHKEY repo secret - Tailscale auth key (reusable + ephemeral)
-#   RDP_PASSWORD - hardcoded below in the top-level `env:` block.
-#     !! Owner's explicit choice to hardcode. Change it to anything you like,
-#     !! but know that in a PUBLIC repo anyone can read this file. Do NOT reuse
-#     !! a password you use anywhere else. Bots scan public repos for RDP
-#     !! workflows + passwords within minutes of a run starting.
+#   RDP password - inline as $rdpPassword in the RDP configuration step.
 #     Never reboot Windows from INSIDE the RDP session: the runner agent dies
 #     with the VM and the job fails. To get a fresh system, run the companion
 #     workflow "Windows RDP Restart" (windows-rdp-restart.yml).
 # =====================================================================
 
 name: Windows Cloud RDP
-
-# Hardcoded RDP password (single source of truth - edit here only).
-env:
-  RDP_PASSWORD: 'cynet@2026'   # <-- EDIT: password (user: CynetAdmin, backup: runneradmin)
 
 on:
   workflow_dispatch:
@@ -66,6 +58,11 @@ on:
         type: boolean
         required: false
         default: false
+      client_tailscale_ip:
+        type: string
+        description: 'Optional: your PC Tailscale IPv4 for latency/path checks (or set repo variable RDP_CLIENT_TS_IP)'
+        required: false
+        default: ''
 
 # Least privilege: the job only reads the repo.
 permissions:
@@ -79,21 +76,14 @@ jobs:
     steps:
 
       # -------------------------------------------------------------
-      # 0. PREFLIGHT - secrets present, record job start epoch
+      # 0. PREFLIGHT - record job start epoch
       # -------------------------------------------------------------
-      - name: 0. Preflight (password check + start clock)
+      - name: 0. Preflight (start clock)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           "JOB_START_EPOCH=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
-
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "RDP_PASSWORD is empty - set it in the env: block at the top of this file."
-          }
-          if ($env:RDP_PASSWORD -eq 'CHANGE_ME' -or $env:RDP_PASSWORD.Length -lt 8) {
-            throw "RDP_PASSWORD is a placeholder or too short - edit env.RDP_PASSWORD at the top of this file."
-          }
-          Write-Host "Preflight OK: password set in file, clock started." -ForegroundColor Green
+          Write-Host 'Preflight OK: job clock started.' -ForegroundColor Green
 
       # -------------------------------------------------------------
       # 1. TAILSCALE FIRST - fastest possible path to a reachable IP
@@ -148,11 +138,15 @@ jobs:
           Set-ItemProperty -Path $ts  -Name fDenyTSConnections -Value 0
           Set-ItemProperty -Path $rdp -Name UserAuthentication  -Value $env:NLA_FLAG -ErrorAction SilentlyContinue
 
-          # Performance tuning (visual effects off, compression on)
+          # Performance tuning: allow both RDP transports (UDP is usually more responsive),
+          # while preserving the requested wallpaper and dark Windows theme.
           Set-ItemProperty -Path $pol -Name fCompressionEnabled  -Type DWord -Value 1 -Force
+          Set-ItemProperty -Path $pol -Name SelectTransport      -Type DWord -Value 0 -Force
           Set-ItemProperty -Path $pol -Name fDisableAudioCapture -Type DWord -Value 1 -Force
           Set-ItemProperty -Path $pol -Name fDisableCdm          -Type DWord -Value 1 -Force
-          foreach ($n in 'fDisableWallpaper','fDisableFullWindowDrag','fDisableMenuAnims','fDisableThemes') {
+          Set-ItemProperty -Path $rdp -Name fDisableWallpaper -Value 0 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path $rdp -Name fDisableThemes    -Value 0 -ErrorAction SilentlyContinue
+          foreach ($n in 'fDisableFullWindowDrag','fDisableMenuAnims') {
             Set-ItemProperty -Path $rdp -Name $n -Value 1 -ErrorAction SilentlyContinue
           }
 
@@ -162,8 +156,12 @@ jobs:
           powercfg /change standby-timeout-ac 0
           powercfg /change hibernate-timeout-ac 0
 
-          # Password comes from the secret - never from this file
-          $pw = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          # Edit this hard-coded password here.
+          $rdpPassword = 'cynet@2026'
+          if ($rdpPassword -eq 'CHANGE_ME' -or $rdpPassword.Length -lt 8) {
+            throw 'RDP password is a placeholder or too short; edit $rdpPassword in this step.'
+          }
+          $pw = ConvertTo-SecureString $rdpPassword -AsPlainText -Force
           if (Get-LocalUser -Name runneradmin -ErrorAction SilentlyContinue) {
             Set-LocalUser  -Name runneradmin -Password $pw
           } else {
@@ -208,55 +206,112 @@ jobs:
           Write-Host 'RDP ready (verify gate PASS).' -ForegroundColor Green
 
       # -------------------------------------------------------------
-      # 3b. AUTO-DOWNLOAD + AUTO-MOVE TO DESKTOP (CynetAdmin).
-      #     Drops windows-rdp.yml + agent.ps1 + fgi.ps1 onto the
-      #     desktop of user CynetAdmin (and Public Desktop).
-      #     Source: this repo's raw URLs (public, no login, no API).
-      #     Fallback: embedded copies guarantee the files appear even
-      #     if the repo copies are not committed yet. Non-fatal step.
+      # 3b. DESKTOP - dark theme, wallpaper, This PC icon, script cleanup
       # -------------------------------------------------------------
-      - name: 3b. Auto-download files to CynetAdmin desktop
+      - name: 3b. Configure desktop and remove script clutter
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
-          $rawBase = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/raw/$env:GITHUB_REF_NAME"
-          $desks   = @('C:\Users\CynetAdmin\Desktop', 'C:\Users\Public\Desktop')
+          $ErrorActionPreference = 'Stop'
+          $wallpaperUrl  = 'https://4kwallpapers.com/images/walls/thumbs_2t/27235.jpg'
+          $wallpaperPath = 'C:\Users\Public\Pictures\anime-wallpaper.jpg'
+          New-Item -ItemType Directory -Path (Split-Path $wallpaperPath) -Force | Out-Null
 
-          foreach ($d in $desks) {
-            try {
-              New-Item -ItemType Directory -Path $d -Force | Out-Null
-
-              # 1) this workflow file
-              & curl.exe -sSL --fail --retry 3 --retry-delay 2 --connect-timeout 15 `
-                -o "$d\windows-rdp.yml" "$rawBase/.github/workflows/windows-rdp.yml"
-              if ((Test-Path "$d\windows-rdp.yml") -and ((Get-Item "$d\windows-rdp.yml").Length -gt 1000)) {
-                Write-Host "placed: $d\windows-rdp.yml" -ForegroundColor Green
-              } else {
-                Write-Host "missed: windows-rdp.yml (commit it to the repo, then re-run)" -ForegroundColor Yellow
-              }
-
-              # 2) fgi.ps1 client (raw repo copy preferred, embedded fallback)
-              $ok = $false
-              & curl.exe -sSL --fail --retry 3 --retry-delay 2 --connect-timeout 15 `
-                -o "$d\fgi.ps1" "$rawBase/fgi.ps1"
-              if ((Test-Path "$d\fgi.ps1") -and ((Get-Item "$d\fgi.ps1").Length -gt 500)) { $ok = $true }
-              if (-not $ok) {
-                Write-Host "fgi.ps1: repo copy missing - commit fgi.ps1 to repo root for auto-updates" -ForegroundColor Yellow
-              } else {
-                Write-Host "placed: $d\fgi.ps1 (downloaded)" -ForegroundColor Green
-              }
-
-              # 3) agent.ps1 (raw repo copy; downloaded only if committed)
-              & curl.exe -sSL --fail --retry 3 --retry-delay 2 --connect-timeout 15 `
-                -o "$d\agent.ps1" "$rawBase/agent.ps1"
-              if ((Test-Path "$d\agent.ps1") -and ((Get-Item "$d\agent.ps1").Length -gt 500)) {
-                Write-Host "placed: $d\agent.ps1 (downloaded)" -ForegroundColor Green
-              } else {
-                Write-Host "agent.ps1: not in repo yet - commit agent.ps1 to repo root, then re-run" -ForegroundColor Yellow
-              }
-            } catch { Write-Host ("error for ${d}: " + $_.Exception.Message) -ForegroundColor Yellow }
+          # The wallpaper host challenges generic command-line clients, so use a browser UA + site referer.
+          $wallpaperReady = $false
+          try {
+            & curl.exe --fail --silent --show-error --location --retry 3 --retry-delay 2 `
+              --connect-timeout 15 --max-time 90 `
+              --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36' `
+              --referer 'https://4kwallpapers.com/' `
+              --output $wallpaperPath $wallpaperUrl
+            $curlCode = $LASTEXITCODE
+            if ($curlCode -eq 0 -and (Test-Path $wallpaperPath) -and (Get-Item $wallpaperPath).Length -gt 10240) {
+              $wallpaperReady = $true
+              Write-Host 'Anime wallpaper downloaded.' -ForegroundColor Green
+            } else {
+              Write-Host "Wallpaper download failed (curl exit $curlCode); dark theme and This PC icon will still be applied." -ForegroundColor Yellow
+            }
+          } catch {
+            Write-Host ('Wallpaper download failed; continuing with other desktop settings: ' + $_.Exception.Message) -ForegroundColor Yellow
           }
-          Write-Host 'Desktop drop complete (RDP in as CynetAdmin to see the files).' -ForegroundColor Green
+
+          function Set-RdpDesktopDefaults {
+            param([string]$Root, [bool]$SetWallpaper)
+
+            $personalize = "$Root\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            New-Item -Path $personalize -Force | Out-Null
+            New-ItemProperty -Path $personalize -Name AppsUseLightTheme   -PropertyType DWord -Value 0 -Force | Out-Null
+            New-ItemProperty -Path $personalize -Name SystemUsesLightTheme -PropertyType DWord -Value 0 -Force | Out-Null
+
+            if ($SetWallpaper) {
+              $desktop = "$Root\Control Panel\Desktop"
+              New-Item -Path $desktop -Force | Out-Null
+              New-ItemProperty -Path $desktop -Name Wallpaper      -PropertyType String -Value $wallpaperPath -Force | Out-Null
+              New-ItemProperty -Path $desktop -Name WallpaperStyle -PropertyType String -Value '10' -Force | Out-Null
+              New-ItemProperty -Path $desktop -Name TileWallpaper  -PropertyType String -Value '0' -Force | Out-Null
+            }
+
+            # Show This PC in both modern and classic desktop-icon views.
+            $thisPcGuid = '{20D04FE0-3AEA-1069-A2D8-08002B30309D}'
+            foreach ($view in 'NewStartPanel','ClassicStartMenu') {
+              $icons = "$Root\Software\Microsoft\Windows\CurrentVersion\Explorer\HideDesktopIcons\$view"
+              New-Item -Path $icons -Force | Out-Null
+              New-ItemProperty -Path $icons -Name $thisPcGuid -PropertyType DWord -Value 0 -Force | Out-Null
+            }
+          }
+
+          # Seed the default profile so CynetAdmin gets these settings at first RDP sign-in.
+          $defaultHive = 'C:\Users\Default\NTUSER.DAT'
+          if (-not (Test-Path $defaultHive)) { throw "Default Windows profile hive not found: $defaultHive" }
+          & reg.exe load 'HKU\RdpDesktopDefault' $defaultHive | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'Could not load the default Windows profile hive.' }
+          try {
+            Set-RdpDesktopDefaults -Root 'Registry::HKEY_USERS\RdpDesktopDefault' -SetWallpaper:$wallpaperReady
+          } finally {
+            & reg.exe unload 'HKU\RdpDesktopDefault' | Out-Null
+          }
+
+          # Also apply the settings to profiles that already exist (for example runneradmin).
+          foreach ($userName in 'CynetAdmin','runneradmin') {
+            $account = Get-LocalUser -Name $userName -ErrorAction SilentlyContinue
+            if (-not $account) { continue }
+            $sid = $account.SID.Value
+            $profile = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $profile -or -not $profile.LocalPath) { continue }
+            $ntuser = Join-Path $profile.LocalPath 'NTUSER.DAT'
+            if (-not (Test-Path $ntuser)) { continue }
+
+            if ($profile.Loaded) {
+              Set-RdpDesktopDefaults -Root "Registry::HKEY_USERS\$sid" -SetWallpaper:$wallpaperReady
+            } else {
+              $hiveKey = 'RdpDesktop_' + ($sid -replace '[^A-Za-z0-9_]', '_')
+              $hiveMount = "HKU\$hiveKey"
+              & reg.exe load $hiveMount $ntuser | Out-Null
+              if ($LASTEXITCODE -eq 0) {
+                try {
+                  Set-RdpDesktopDefaults -Root "Registry::HKEY_USERS\$hiveKey" -SetWallpaper:$wallpaperReady
+                } finally {
+                  & reg.exe unload $hiveMount | Out-Null
+                }
+              } else {
+                Write-Host "Could not load existing profile for $userName; default-profile settings remain in place." -ForegroundColor Yellow
+              }
+            }
+          }
+
+          # Remove leftovers from earlier versions; no helper scripts are downloaded anymore.
+          $desktopPaths = @('C:\Users\CynetAdmin\Desktop', 'C:\Users\Public\Desktop')
+          foreach ($desktop in $desktopPaths) {
+            if (-not (Test-Path $desktop)) { continue }
+            Get-ChildItem -LiteralPath $desktop -Force -Recurse -File -ErrorAction SilentlyContinue |
+              Where-Object {
+                $_.Extension -ieq '.ps1' -or
+                $_.Name -match '(?i)fgi' -or
+                $_.Name -ieq 'windows-rdp.yml'
+              } |
+              Remove-Item -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host 'Desktop configured: dark theme, wallpaper (when downloadable), This PC icon; no fgi or PowerShell files are placed on the desktop.' -ForegroundColor Green
 
       # -------------------------------------------------------------
       # 3. PUBLISH connection info (IP only - never the password)
@@ -273,13 +328,14 @@ jobs:
             "| Address | ``$ip`` |",
             "| Connect | ``mstsc /v:$ip`` |",
             "| User    | ``CynetAdmin`` (backup: ``runneradmin``) |",
-            "| Password| hardcoded in this workflow (env.RDP_PASSWORD at top) |",
+            "| Desktop | dark theme, anime wallpaper, This PC icon |",
+            "| RDP transport | UDP + TCP (automatic fallback) |",
             "| NLA     | ${{ inputs.nla }} |",
             "| Scope   | ${{ inputs.rdp_scope }} |",
             '',
             'Tip: keep this tab open; session ends when the job times out.'
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          Write-Host "Connect with: mstsc /v:$ip  (user: runneradmin, password: your RDP_PASSWORD secret)"
+          Write-Host "Connect with: mstsc /v:$ip  (user: CynetAdmin; use the hard-coded password in the RDP setup step)"
 
       # -------------------------------------------------------------
       # 4. OPTIONAL - verify Python/Java wiring (preinstalled on image)
@@ -326,16 +382,33 @@ jobs:
           Write-Host "Disk free: $before GB -> $after GB" -ForegroundColor Green
 
       # -------------------------------------------------------------
-      # 6. CONNECTION QUALITY - direct vs relay, logged every 5 min
+      # 6. NETWORK DIAGNOSTICS - Tailscale path, netcheck, optional client RTT
       # -------------------------------------------------------------
-      - name: 7. Check connection quality (direct or relay?)
+      - name: 7. Check Tailscale path and client latency
         shell: pwsh
+        env:
+          RDP_CLIENT_TS_IP: ${{ inputs.client_tailscale_ip || vars.RDP_CLIENT_TS_IP }}
         run: |
-          $status = (& "C:\Program Files\Tailscale\tailscale.exe" status 2>&1 | Out-String).Trim()
-          if ($status -match 'relay') {
-            Write-Host "PATH: relayed (DERP). Still works, higher latency. UDP 3478 outbound is allowed on GH runners; a direct path usually negotiates within the first minutes." -ForegroundColor Yellow
+          $ts = "C:\Program Files\Tailscale\tailscale.exe"
+          $status = (& $ts status 2>&1 | Out-String).Trim()
+          if ($status -match 'peer-relay') {
+            Write-Host 'Tailscale path: peer relay detected.' -ForegroundColor Yellow
+          } elseif ($status -match 'relay') {
+            Write-Host 'Tailscale path: DERP relay detected; direct UDP is preferable when both networks allow it.' -ForegroundColor Yellow
+          } elseif ($status -match 'direct') {
+            Write-Host 'Tailscale path: direct peer connection detected.' -ForegroundColor Green
           } else {
-            Write-Host "PATH: direct (best case - low latency, full speed)." -ForegroundColor Green
+            Write-Host 'Tailscale is connected; no active peer path is reported yet.' -ForegroundColor Yellow
+          }
+
+          Write-Host 'Tailscale network check (UDP/NAT and nearest relay diagnostics):' -ForegroundColor Cyan
+          & $ts netcheck 2>&1 | ForEach-Object { Write-Host $_ }
+
+          if ($env:RDP_CLIENT_TS_IP -match '^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$') {
+            Write-Host "Measuring Tailscale RTT/path to client $env:RDP_CLIENT_TS_IP (up to 10 probes):" -ForegroundColor Cyan
+            & $ts ping --c 10 $env:RDP_CLIENT_TS_IP 2>&1 | ForEach-Object { Write-Host $_ }
+          } else {
+            Write-Host 'For an automatic client-specific RTT check, set the workflow input client_tailscale_ip or repo variable RDP_CLIENT_TS_IP to your PC 100.x address.' -ForegroundColor Yellow
           }
 
       # -------------------------------------------------------------
@@ -345,7 +418,8 @@ jobs:
       - name: 8. Keep session alive (auto-clamped)
         shell: pwsh
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          KEEPALIVE_INPUT: ${{ inputs.keepalive_minutes }}
+          RDP_CLIENT_TS_IP: ${{ inputs.client_tailscale_ip || vars.RDP_CLIENT_TS_IP }}
         run: |
           $start   = [DateTimeOffset]::FromUnixTimeSeconds([long]$env:JOB_START_EPOCH).UtcDateTime
           $elapsed = [double](([DateTimeOffset]::UtcNow) - $start).TotalMinutes
@@ -369,7 +443,10 @@ jobs:
             Start-Sleep -Seconds 60
             if (($i % 5) -eq 0) {
               $peer = (& $ts status 2>&1 | Out-String)
-              $path = if ($peer -match 'relay "') { 'relay' } else { 'direct/offline-idle' }
+              if ($peer -match 'peer-relay') { $path = 'peer relay' }
+              elseif ($peer -match 'relay') { $path = 'DERP relay' }
+              elseif ($peer -match 'direct') { $path = 'direct' }
+              else { $path = 'idle/unknown' }
               Write-Host "[$i/$total min] running - path: $path" -ForegroundColor Green
             }
           }
