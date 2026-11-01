@@ -89,18 +89,47 @@ jobs:
           Set-RdpStage 'Finding Tailscale address'
           $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
           if (-not (Test-Path $tsExe)) { throw 'Tailscale executable not found.' }
+          # Inspect only this runner's own address. Never print the raw
+          # Tailscale status: it includes other devices and account names.
+          function Get-OwnTailscaleIPv4 {
+            $addresses = @()
+            try {
+              $raw = (& $tsExe status --json 2>$null | Out-String)
+              if ($LASTEXITCODE -eq 0 -and $raw.Trim()) {
+                $state = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($state.Self -and $state.Self.TailscaleIPs) {
+                  $addresses += @($state.Self.TailscaleIPs)
+                } elseif ($state.TailscaleIPs) {
+                  $addresses += @($state.TailscaleIPs)
+                }
+              }
+            } catch { }
+            # Fallback to the local-only CLI output. Never log the raw output.
+            if (-not $addresses.Count) {
+              try { $addresses += @(& $tsExe ip -4 2>$null) } catch { }
+            }
+            foreach ($candidate in $addresses) {
+              $address = $null
+              $value = ([string]$candidate).Trim()
+              if ([System.Net.IPAddress]::TryParse($value, [ref]$address) -and
+                  $address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                $bytes = $address.GetAddressBytes()
+                if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) {
+                  return $address.ToString()
+                }
+              }
+            }
+            return $null
+          }
           $ip = $null
           for ($i = 0; $i -lt 60; $i++) {
-            $candidate = (& $tsExe ip -4 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -eq 0 -and $candidate -match '^100\.(\d{1,3}\.){2}\d{1,3}$') {
-              $ip = $candidate.Trim()
-              break
-            }
+            $ip = Get-OwnTailscaleIPv4
+            if ($ip) { break }
             Start-Sleep -Seconds 1
           }
           if (-not $ip) {
-            & $tsExe status
-            throw 'Tailscale has no IPv4 address. Check auth key, device authorization, and tailnet policy.'
+            # Do not print tailscale status, even when troubleshooting.
+            throw "Could not determine this runner's own Tailscale IPv4 address. Check that the device is authorized and Tailscale is running."
           }
           Set-RdpStage 'Finding Tailscale network interface'
           $adapter = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $ip -ErrorAction Stop | Select-Object -First 1
@@ -351,7 +380,7 @@ jobs:
                 $recoveryAttempts++
                 $lastRecovery = [DateTimeOffset]::UtcNow
                 Write-Warning "Tailscale is stopped; attempting reconnect ($recoveryAttempts/3)."
-                & $tsExe up --timeout=20s 2>&1 | Out-Host
+                $null = & $tsExe up --timeout=20s 2>&1
                 if ($LASTEXITCODE -ne 0) { Write-Warning 'Reconnect failed; check Tailscale settings.' }
               } elseif ($state.BackendState -eq 'NeedsLogin') {
                 Write-Warning 'Tailscale needs authentication; rerun the workflow with a valid key.'
@@ -365,7 +394,7 @@ jobs:
                 else { Write-Host "Active Tailscale paths: direct=$direct, relayed=$relay (may include peers other than the RDP client)." }
                 $nextPathReport = [DateTimeOffset]::UtcNow.AddMinutes(5)
               }
-            } catch { Write-Warning "Tailscale health check unavailable: $($_.Exception.Message)" }
+            } catch { Write-Warning 'Tailscale health check unavailable; no device details were logged.' }
             $seconds = [Math]::Min(60, [Math]::Ceiling(($deadline - [DateTimeOffset]::UtcNow).TotalSeconds))
             if ($seconds -gt 0) { Start-Sleep -Seconds $seconds }
           }
@@ -430,7 +459,6 @@ jobs:
               if ($LASTEXITCODE -eq 0 -and $raw.Trim()) {
                 $status = $raw | ConvertFrom-Json
                 Write-Host "Tailscale backend state: $($status.BackendState)"
-                Write-Host "Tailscale assigned IPv4: $(($status.TailscaleIPs | Where-Object { $_ -match '^100\.' }) -join ', ')"
               } else { Write-Warning 'Tailscale status is unavailable.' }
             } catch { Write-Warning 'Could not parse Tailscale status.' }
           }
