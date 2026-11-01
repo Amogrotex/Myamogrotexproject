@@ -20,8 +20,12 @@ on:
         description: 'Report preinstalled Python and Java versions'
         type: boolean
         default: false
+      rdp_optimization:
+        description: 'Prefer RDP compression for lower bandwidth (may use more CPU)'
+        type: boolean
+        default: true
       bandwidth_mode:
-        description: 'Reduce RDP bandwidth (hides wallpaper during RDP)'
+        description: 'Further reduce RDP bandwidth by hiding wallpaper during RDP'
         type: boolean
         default: false
       nla:
@@ -79,6 +83,7 @@ jobs:
         shell: pwsh
         env:
           REQUIRE_NLA: ${{ inputs.nla && '1' || '0' }}
+          OPTIMIZE_RDP: ${{ inputs.rdp_optimization && '1' || '0' }}
           BANDWIDTH_MODE: ${{ inputs.bandwidth_mode && '1' || '0' }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -140,12 +145,25 @@ jobs:
           $rdpTcp = "$terminalServer\WinStations\RDP-Tcp"
           Set-ItemProperty -Path $terminalServer -Name fDenyTSConnections -Value 0
           Set-ItemProperty -Path $rdpTcp -Name UserAuthentication -Type DWord -Value ([int]$env:REQUIRE_NLA)
-          # Bandwidth mode opts into RDP compression and removes the wallpaper in RDP.
+          # Use the documented RDP compression policy for slower links.
+          # It can reduce bandwidth at a CPU cost; it does not guarantee FPS.
+          # Keep TCP and UDP available and let the client negotiate transport.
           $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $policy -Force | Out-Null
-          if ($env:BANDWIDTH_MODE -eq '1') {
-            New-ItemProperty -Path $policy -Name fCompressionEnabled -PropertyType DWord -Value 1 -Force | Out-Null
+          if ($env:OPTIMIZE_RDP -eq '1') {
+            try {
+              # MaxCompressionLevel 3 = optimized to use less network bandwidth.
+              New-ItemProperty -Path $policy -Name MaxCompressionLevel -PropertyType DWord -Value 3 -Force -ErrorAction Stop | Out-Null
+              'RDP_OPTIMIZATION_RESULT=Requested compression: less network bandwidth' >> $env:GITHUB_ENV
+            } catch {
+              Write-Warning 'Could not apply the optional RDP compression policy; continuing with Windows defaults.'
+              'RDP_OPTIMIZATION_RESULT=Compression policy unavailable; Windows defaults' >> $env:GITHUB_ENV
+            }
+          } else {
+            'RDP_OPTIMIZATION_RESULT=Off; Windows defaults' >> $env:GITHUB_ENV
           }
+          # The wallpaper remains visible by default. The separate bandwidth
+          # mode may hide it in an RDP session if the user chooses that tradeoff.
           New-ItemProperty -Path $policy -Name fNoRemoteDesktopWallpaper -PropertyType DWord -Value ([int]$env:BANDWIDTH_MODE) -Force | Out-Null
 
           Set-RdpStage 'Creating or updating CynetAdmin account'
@@ -307,6 +325,7 @@ jobs:
             '| User | ``CynetAdmin`` |',
             '| Password | Hardcoded in env.RDP_PASSWORD at the top of this workflow |',
             "| Network Level Authentication | $env:REQUIRE_NLA |",
+            "| RDP optimization | $env:RDP_OPTIMIZATION_RESULT |",
             "| Bandwidth mode | $env:BANDWIDTH_MODE (when enabled, wallpaper is hidden in RDP) |",
             "| Iran time zone | $env:TIMEZONE_RESULT (see desktop setup log on failure) |",
             "| Wallpaper | $env:WALLPAPER_RESULT (see desktop setup log on failure) |",
