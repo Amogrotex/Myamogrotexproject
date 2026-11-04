@@ -170,7 +170,7 @@ jobs:
             if ($ip) { break }
             Start-Sleep -Seconds 1
           }
-          if (-not $ip) { throw 'Could not find this runner’s Tailscale IPv4. Check device authorization and Tailscale.' }
+          if (-not $ip) { throw 'Could not find this runner''s Tailscale IPv4. Check ...' }
           Set-RdpStage 'Finding Tailscale interface'
           $adapter = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $ip -ErrorAction Stop | Select-Object -First 1
           if (-not $adapter.InterfaceAlias) { throw 'Could not identify the Tailscale interface.' }
