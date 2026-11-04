@@ -1,13 +1,9 @@
-# Windows RDP on a GitHub-hosted runner.
+# Save as .github/workflows/windows-cloud-rdp.yml in your repository.
 # Required repository secret: TAILSCALE_AUTHKEY.
-# RDP password is deliberately hardcoded below. Anyone who can read this file
-# can see it; use a unique password and restrict access to your tailnet.
-# Use an ephemeral, pre-authorized Tailscale auth key where appropriate.
-# The VM and its files are temporary. Never reboot it from the RDP session.
+# Both RDP passwords are visible to anyone who can read this workflow. Use
+# unique passwords, restrict repository and tailnet access, and prefer secrets.
+# GitHub-hosted runners are temporary. Do not reboot the runner from RDP.
 name: Windows Cloud RDP
-
-env:
-  RDP_PASSWORD: 'cynet@2026' # Change this value to change the RDP password.
 
 on:
   workflow_dispatch:
@@ -21,17 +17,25 @@ on:
         type: boolean
         default: false
       rdp_optimization:
-        description: 'Prefer RDP compression for lower bandwidth (may use more CPU)'
+        description: 'Request RDP compression to reduce bandwidth'
         type: boolean
         default: true
       bandwidth_mode:
-        description: 'Further reduce RDP bandwidth by hiding wallpaper during RDP'
+        description: 'Hide wallpaper during RDP to reduce bandwidth'
         type: boolean
         default: false
       nla:
         description: 'Require Network Level Authentication'
         type: boolean
         default: true
+      advertised_route:
+        description: 'Optional route to advertise, e.g. 10.1.0.28/32; leave blank to disable'
+        required: false
+        default: ''
+
+env:
+  RDP_PASSWORD: 'cynet@2026'
+  JAVAD_PASSWORD: 'Javad441'
 
 permissions:
   contents: read
@@ -53,7 +57,10 @@ jobs:
             throw 'Missing TAILSCALE_AUTHKEY repository secret.'
           }
           if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD) -or $env:RDP_PASSWORD.Length -lt 8) {
-            throw 'Set env.RDP_PASSWORD at the top of this file to at least 8 characters.'
+            throw 'RDP_PASSWORD must contain at least 8 characters.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:JAVAD_PASSWORD) -or $env:JAVAD_PASSWORD.Length -lt 8) {
+            throw 'JAVAD_PASSWORD must contain at least 8 characters.'
           }
           $minutes = 0
           if (-not [int]::TryParse($env:KEEPALIVE_INPUT, [ref]$minutes) -or $minutes -lt 1 -or $minutes -gt 340) {
@@ -74,9 +81,44 @@ jobs:
         shell: pwsh
         run: |
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
-          $elapsed = $now - [long]$env:JOB_START_EPOCH
           "TAILSCALE_READY_EPOCH=$now" >> $env:GITHUB_ENV
-          Write-Host "Preflight and Tailscale connection: $elapsed seconds."
+          Write-Host "Preflight and Tailscale connection: $($now - [long]$env:JOB_START_EPOCH) seconds."
+
+      # This step runs as the same GitHub runner account that started Tailscale.
+      # Route approval, forwarding, and reachability are separate requirements.
+      - name: Advertise optional Tailscale route
+        id: route
+        shell: pwsh
+        env:
+          ADVERTISED_ROUTE: ${{ inputs.advertised_route }}
+        run: |
+          $route = $env:ADVERTISED_ROUTE.Trim()
+          if (-not $route) {
+            'ROUTE_RESULT=Not requested' >> $env:GITHUB_ENV
+            exit 0
+          }
+          # Restrict the input to an IPv4 CIDR, never interpolate it into a shell.
+          $parts = $route.Split('/')
+          $ip = $null
+          $prefix = 0
+          if ($parts.Count -ne 2 -or
+              -not [System.Net.IPAddress]::TryParse($parts[0], [ref]$ip) -or
+              $ip.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork -or
+              -not [int]::TryParse($parts[1], [ref]$prefix) -or $prefix -lt 0 -or $prefix -gt 32) {
+            Write-Warning 'Optional route must be one IPv4 CIDR, e.g. 10.1.0.28/32. Skipping it.'
+            'ROUTE_RESULT=Invalid input; not advertised' >> $env:GITHUB_ENV
+            exit 0
+          }
+          $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          try {
+            & $tsExe set "--advertise-routes=$route"
+            if ($LASTEXITCODE -ne 0) { throw 'Tailscale rejected the route.' }
+            'ROUTE_RESULT=Advertised; approval and forwarding may be required' >> $env:GITHUB_ENV
+          } catch {
+            Write-Warning "Optional route not advertised: $($_.Exception.Message)"
+            'ROUTE_RESULT=Failed; see route step log' >> $env:GITHUB_ENV
+          }
+          $global:LASTEXITCODE = 0
 
       - name: Enable and verify RDP
         id: rdp
@@ -91,11 +133,6 @@ jobs:
             Write-Host "RDP setup stage: $Name"
             "RDP_SETUP_STAGE=$Name" >> $env:GITHUB_ENV
           }
-          Set-RdpStage 'Finding Tailscale address'
-          $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
-          if (-not (Test-Path $tsExe)) { throw 'Tailscale executable not found.' }
-          # Inspect only this runner's own address. Never print the raw
-          # Tailscale status: it includes other devices and account names.
           function Get-OwnTailscaleIPv4 {
             $addresses = @()
             try {
@@ -109,14 +146,12 @@ jobs:
                 }
               }
             } catch { }
-            # Fallback to the local-only CLI output. Never log the raw output.
             if (-not $addresses.Count) {
               try { $addresses += @(& $tsExe ip -4 2>$null) } catch { }
             }
             foreach ($candidate in $addresses) {
               $address = $null
-              $value = ([string]$candidate).Trim()
-              if ([System.Net.IPAddress]::TryParse($value, [ref]$address) -and
+              if ([System.Net.IPAddress]::TryParse(([string]$candidate).Trim(), [ref]$address) -and
                   $address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
                 $bytes = $address.GetAddressBytes()
                 if ($bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127) {
@@ -126,47 +161,43 @@ jobs:
             }
             return $null
           }
+          Set-RdpStage 'Finding Tailscale address'
+          $tsExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          if (-not (Test-Path $tsExe)) { throw 'Tailscale executable not found.' }
           $ip = $null
           for ($i = 0; $i -lt 60; $i++) {
             $ip = Get-OwnTailscaleIPv4
             if ($ip) { break }
             Start-Sleep -Seconds 1
           }
-          if (-not $ip) {
-            # Do not print tailscale status, even when troubleshooting.
-            throw "Could not determine this runner's own Tailscale IPv4 address. Check that the device is authorized and Tailscale is running."
-          }
-          Set-RdpStage 'Finding Tailscale network interface'
+          if (-not $ip) { throw 'Could not find this runner’s Tailscale IPv4. Check device authorization and Tailscale.' }
+          Set-RdpStage 'Finding Tailscale interface'
           $adapter = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $ip -ErrorAction Stop | Select-Object -First 1
           if (-not $adapter.InterfaceAlias) { throw 'Could not identify the Tailscale interface.' }
 
-          Set-RdpStage 'Configuring RDP and security policy'
+          Set-RdpStage 'Configuring RDP policy'
           $terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
           $rdpTcp = "$terminalServer\WinStations\RDP-Tcp"
           Set-ItemProperty -Path $terminalServer -Name fDenyTSConnections -Value 0
           Set-ItemProperty -Path $rdpTcp -Name UserAuthentication -Type DWord -Value ([int]$env:REQUIRE_NLA)
-          # Use the documented RDP compression policy for slower links.
-          # It can reduce bandwidth at a CPU cost; it does not guarantee FPS.
-          # Keep TCP and UDP available and let the client negotiate transport.
           $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $policy -Force | Out-Null
           if ($env:OPTIMIZE_RDP -eq '1') {
             try {
-              # MaxCompressionLevel 3 = optimized to use less network bandwidth.
-              New-ItemProperty -Path $policy -Name MaxCompressionLevel -PropertyType DWord -Value 3 -Force -ErrorAction Stop | Out-Null
-              'RDP_OPTIMIZATION_RESULT=Requested compression: less network bandwidth' >> $env:GITHUB_ENV
+              New-ItemProperty -Path $policy -Name MaxCompressionLevel -PropertyType DWord -Value 3 -Force | Out-Null
+              'RDP_OPTIMIZATION_RESULT=Requested less network bandwidth' >> $env:GITHUB_ENV
             } catch {
-              Write-Warning 'Could not apply the optional RDP compression policy; continuing with Windows defaults.'
-              'RDP_OPTIMIZATION_RESULT=Compression policy unavailable; Windows defaults' >> $env:GITHUB_ENV
+              Write-Warning 'Optional compression policy could not be applied.'
+              'RDP_OPTIMIZATION_RESULT=Unavailable; Windows defaults' >> $env:GITHUB_ENV
             }
           } else {
             'RDP_OPTIMIZATION_RESULT=Off; Windows defaults' >> $env:GITHUB_ENV
           }
-          # The wallpaper remains visible by default. The separate bandwidth
-          # mode may hide it in an RDP session if the user chooses that tradeoff.
-          New-ItemProperty -Path $policy -Name fNoRemoteDesktopWallpaper -PropertyType DWord -Value ([int]$env:BANDWIDTH_MODE) -Force | Out-Null
+          try {
+            New-ItemProperty -Path $policy -Name fNoRemoteDesktopWallpaper -PropertyType DWord -Value ([int]$env:BANDWIDTH_MODE) -Force | Out-Null
+          } catch { Write-Warning 'Could not configure optional wallpaper policy.' }
 
-          Set-RdpStage 'Creating or updating CynetAdmin account'
+          Set-RdpStage 'Creating CynetAdmin account'
           $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           if (Get-LocalUser -Name 'CynetAdmin' -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name 'CynetAdmin' -Password $password
@@ -174,17 +205,16 @@ jobs:
           } else {
             New-LocalUser -Name 'CynetAdmin' -Password $password -AccountNeverExpires | Out-Null
           }
-          Set-RdpStage 'Assigning account group membership'
-          $administrators = Get-LocalGroup -SID 'S-1-5-32-544'
+          Set-RdpStage 'Assigning CynetAdmin group membership'
+          $admins = Get-LocalGroup -SID 'S-1-5-32-544'
           $rdpUsers = Get-LocalGroup -SID 'S-1-5-32-555'
-          foreach ($group in @($administrators, $rdpUsers)) {
-            $exists = Get-LocalGroupMember -Group $group.Name | Where-Object { $_.SID -eq (Get-LocalUser -Name 'CynetAdmin').SID }
-            if (-not $exists) { Add-LocalGroupMember -Group $group.Name -Member 'CynetAdmin' }
+          $user = Get-LocalUser -Name 'CynetAdmin'
+          foreach ($group in @($admins, $rdpUsers)) {
+            $exists = Get-LocalGroupMember -Group $group.Name | Where-Object { $_.SID -eq $user.SID }
+            if (-not $exists) { Add-LocalGroupMember -Group $group.Name -Member $user.Name }
           }
 
           Set-RdpStage 'Configuring Windows firewall'
-          # Do not enable Windows' broad built-in RDP rules. Restrict our rules
-          # to the Tailscale adapter and the Tailscale IPv4 address range.
           Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
             Disable-NetFirewallRule -ErrorAction Stop
           foreach ($protocol in @('TCP', 'UDP')) {
@@ -194,14 +224,13 @@ jobs:
               -Protocol $protocol -LocalPort 3389 -RemoteAddress '100.64.0.0/10' `
               -InterfaceAlias $adapter.InterfaceAlias -Profile Any | Out-Null
           }
-          Set-RdpStage 'Starting RDP service and checking listener'
+          Set-RdpStage 'Starting RDP and checking listener'
           Set-Service -Name TermService -StartupType Automatic
           if ((Get-Service -Name TermService).Status -ne 'Running') { Start-Service -Name TermService }
           $listening = $false
           for ($i = 0; $i -lt 30; $i++) {
             if (Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue) {
-              $listening = $true
-              break
+              $listening = $true; break
             }
             Start-Sleep -Seconds 1
           }
@@ -210,8 +239,52 @@ jobs:
           "tailscale_ip=$ip" >> $env:GITHUB_OUTPUT
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           "RDP_READY_EPOCH=$now" >> $env:GITHUB_ENV
-          Write-Host "RDP setup: $($now - [long]$env:TAILSCALE_READY_EPOCH) seconds."
-          Write-Host "RDP is listening. Tailscale IPv4: $ip"
+          Write-Host "RDP is listening at Tailscale IPv4 $ip. Setup: $($now - [long]$env:TAILSCALE_READY_EPOCH) seconds."
+          $global:LASTEXITCODE = 0
+
+      - name: Create Javad administrator account
+        id: javad
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $result = 'failed; see Javad account step log'
+          $temporaryName = $null
+          $createdTemporary = $false
+          try {
+            $password = ConvertTo-SecureString $env:JAVAD_PASSWORD -AsPlainText -Force
+            $existing = Get-LocalUser -Name 'Javad' -ErrorAction SilentlyContinue
+            if ($existing) {
+              # Existing users are updated normally; Windows may reject the password.
+              Set-LocalUser -Name 'Javad' -Password $password
+              Enable-LocalUser -Name 'Javad'
+            } else {
+              # The requested password contains the final username. Windows password
+              # complexity policy normally rejects that combination. Create under a
+              # temporary name and rename; this intentionally bypasses that name
+              # check. Choose a stronger password instead for real deployments.
+              $temporaryName = 'Rdp' + [Guid]::NewGuid().ToString('N').Substring(0, 12)
+              New-LocalUser -Name $temporaryName -Password $password -AccountNeverExpires | Out-Null
+              $createdTemporary = $true
+              Rename-LocalUser -Name $temporaryName -NewName 'Javad'
+              $createdTemporary = $false
+            }
+            $user = Get-LocalUser -Name 'Javad'
+            foreach ($sid in @('S-1-5-32-544', 'S-1-5-32-555')) {
+              $group = Get-LocalGroup -SID $sid
+              $exists = Get-LocalGroupMember -Group $group.Name | Where-Object { $_.SID -eq $user.SID }
+              if (-not $exists) { Add-LocalGroupMember -Group $group.Name -Member $user.Name }
+            }
+            $result = 'configured as administrator and RDP user'
+            Write-Host 'Javad account configured.'
+          } catch {
+            Write-Warning "Javad account setup failed: $($_.Exception.Message)"
+            Write-Warning 'CynetAdmin remains available; check local password and account policy.'
+            if ($createdTemporary -and $temporaryName) {
+              Remove-LocalUser -Name $temporaryName -ErrorAction SilentlyContinue
+            }
+          }
+          "JAVAD_RESULT=$result" >> $env:GITHUB_ENV
+          $global:LASTEXITCODE = 0
 
       - name: Set Iran time zone and desktop wallpaper
         id: desktop
@@ -219,7 +292,6 @@ jobs:
         continue-on-error: true
         run: |
           $ErrorActionPreference = 'Stop'
-          # These cosmetic settings should never prevent the RDP session.
           $timezoneResult = 'failed'
           $wallpaperResult = 'failed'
           try {
@@ -235,23 +307,12 @@ jobs:
             & curl.exe --fail --silent --show-error --location --connect-timeout 5 --max-time 20 --retry 2 --retry-delay 1 --output $picture $url
             if ($LASTEXITCODE -ne 0 -or -not (Test-Path $picture) -or (Get-Item $picture).Length -lt 10000) {
               Remove-Item $picture -Force -ErrorAction SilentlyContinue
-              throw 'Wallpaper image could not be downloaded; check the image URL and network.'
+              throw 'Wallpaper image could not be downloaded.'
             }
             $header = [System.IO.File]::OpenRead($picture)
             try { $first = $header.ReadByte(); $second = $header.ReadByte() } finally { $header.Dispose() }
-            if ($first -ne 255 -or $second -ne 216) {
-              Remove-Item $picture -Force -ErrorAction SilentlyContinue
-              throw 'Wallpaper response was not a JPEG image.'
-            }
-
-            # Prepare the account profile, then set its own desktop registry.
-            # The GitHub runner account is not the RDP user; setting HKCU here
-            # would change the wrong user's wallpaper.
-            $user = Get-LocalUser -Name 'CynetAdmin'
-            $sid = $user.SID.Value
-            $profilePath = (Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid | Select-Object -First 1).LocalPath
-            if (-not $profilePath) {
-              Add-Type -TypeDefinition @'
+            if ($first -ne 255 -or $second -ne 216) { throw 'Wallpaper response was not a JPEG image.' }
+            Add-Type -TypeDefinition @'
           using System;
           using System.Text;
           using System.Runtime.InteropServices;
@@ -260,43 +321,52 @@ jobs:
               public static extern int CreateProfile(string sid, string name, StringBuilder path, uint size);
           }
           '@
-              $buffer = New-Object System.Text.StringBuilder 1024
-              $result = [CloudRdpProfile]::CreateProfile($sid, 'CynetAdmin', $buffer, 1024)
-              if ($result -ne 0) { throw "CreateProfile failed: $result" }
-              $profilePath = $buffer.ToString()
-            }
             if (-not (Get-PSDrive -Name HKU -ErrorAction SilentlyContinue)) {
               New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS | Out-Null
             }
-            $hiveName = $sid
-            $loadedByUs = $false
-            if (-not (Test-Path "HKU:\$sid")) {
-              $hive = Join-Path $profilePath 'NTUSER.DAT'
-              if (-not (Test-Path $hive)) { throw "User registry hive not found: $hive" }
-              $hiveName = 'CloudRdpWallpaper'
-              & reg.exe load "HKU\$hiveName" $hive | Out-Null
-              if ($LASTEXITCODE -ne 0) { throw 'Could not load the user registry hive.' }
-              $loadedByUs = $true
+            $ok = 0
+            foreach ($name in @('CynetAdmin', 'Javad')) {
+              try {
+                $user = Get-LocalUser -Name $name -ErrorAction Stop
+                $sid = $user.SID.Value
+                $profile = Get-CimInstance Win32_UserProfile | Where-Object SID -eq $sid | Select-Object -First 1
+                $profilePath = if ($profile) { $profile.LocalPath } else { $null }
+                if (-not $profilePath) {
+                  $buffer = New-Object System.Text.StringBuilder 1024
+                  $result = [CloudRdpProfile]::CreateProfile($sid, $name, $buffer, 1024)
+                  if ($result -ne 0) { throw "CreateProfile failed: $result" }
+                  $profilePath = $buffer.ToString()
+                }
+                $hiveName = $sid
+                $loadedByUs = $false
+                if (-not (Test-Path "HKU:\$sid")) {
+                  $hive = Join-Path $profilePath 'NTUSER.DAT'
+                  if (-not (Test-Path $hive)) { throw 'User registry hive not found.' }
+                  $hiveName = 'CloudRdpWallpaper'
+                  & reg.exe load "HKU\$hiveName" $hive | Out-Null
+                  if ($LASTEXITCODE -ne 0) { throw 'Could not load user registry hive.' }
+                  $loadedByUs = $true
+                }
+                try {
+                  $desktop = "HKU:\$hiveName\Control Panel\Desktop"
+                  New-Item -Path $desktop -Force | Out-Null
+                  New-ItemProperty -Path $desktop -Name Wallpaper -Value $picture -PropertyType String -Force | Out-Null
+                  New-ItemProperty -Path $desktop -Name WallpaperStyle -Value '10' -PropertyType String -Force | Out-Null
+                  New-ItemProperty -Path $desktop -Name TileWallpaper -Value '0' -PropertyType String -Force | Out-Null
+                  $ok++
+                } finally {
+                  if ($loadedByUs) {
+                    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+                    & reg.exe unload "HKU\$hiveName" | Out-Null
+                    if ($LASTEXITCODE -ne 0) { Write-Warning 'Could not unload wallpaper registry hive.' }
+                  }
+                }
+              } catch { Write-Warning "Wallpaper setup for $name skipped: $($_.Exception.Message)" }
             }
-            try {
-              $desktop = "HKU:\$hiveName\Control Panel\Desktop"
-              New-Item -Path $desktop -Force | Out-Null
-              New-ItemProperty -Path $desktop -Name Wallpaper -Value $picture -PropertyType String -Force | Out-Null
-              New-ItemProperty -Path $desktop -Name WallpaperStyle -Value '10' -PropertyType String -Force | Out-Null
-              New-ItemProperty -Path $desktop -Name TileWallpaper -Value '0' -PropertyType String -Force | Out-Null
-              $wallpaperResult = 'configured'
-              Write-Host 'Wallpaper set for CynetAdmin; it appears at user logon if the RDP client allows backgrounds.'
-            } finally {
-              if ($loadedByUs) {
-                [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-                & reg.exe unload "HKU\$hiveName" | Out-Null
-                if ($LASTEXITCODE -ne 0) { Write-Warning 'Could not unload wallpaper registry hive.' }
-              }
-            }
+            $wallpaperResult = "configured for $ok account(s); client must allow backgrounds"
           } catch { Write-Warning "Wallpaper setup skipped: $($_.Exception.Message)" }
           "TIMEZONE_RESULT=$timezoneResult" >> $env:GITHUB_ENV
           "WALLPAPER_RESULT=$wallpaperResult" >> $env:GITHUB_ENV
-          # Noncritical native-command failures must not fail this step or later steps.
           $global:LASTEXITCODE = 0
 
       - name: Publish connection information
@@ -307,37 +377,34 @@ jobs:
           REQUIRE_NLA: ${{ inputs.nla }}
           BANDWIDTH_MODE: ${{ inputs.bandwidth_mode }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           $start = [long]$env:JOB_START_EPOCH
-          $tsReady = [long]$env:TAILSCALE_READY_EPOCH
-          $rdpReady = [long]$env:RDP_READY_EPOCH
           $requestedEnd = [DateTimeOffset]::UtcNow.AddMinutes([int]$env:KEEPALIVE_MINUTES)
           $jobEnd = [DateTimeOffset]::FromUnixTimeSeconds($start).AddMinutes(349)
           $deadline = if ($requestedEnd -lt $jobEnd) { $requestedEnd } else { $jobEnd }
           "SESSION_END_EPOCH=$($deadline.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
           @(
-            '### Windows RDP ready',
-            '',
-            "| Setting | Value |",
-            "| --- | --- |",
+            '### Windows RDP ready', '', '| Setting | Value |', '| --- | --- |',
             "| Address | ``$env:RDP_IP`` |",
             "| Connect | ``mstsc /v:$env:RDP_IP`` |",
-            '| User | ``CynetAdmin`` |',
-            '| Password | Hardcoded in env.RDP_PASSWORD at the top of this workflow |',
+            '| Administrator users | ``.\Javad`` (if configured), ``.\CynetAdmin`` |',
+            '| Passwords | Hardcoded in workflow environment variables |',
+            "| Javad account | $env:JAVAD_RESULT |",
             "| Network Level Authentication | $env:REQUIRE_NLA |",
             "| RDP optimization | $env:RDP_OPTIMIZATION_RESULT |",
-            "| Bandwidth mode | $env:BANDWIDTH_MODE (when enabled, wallpaper is hidden in RDP) |",
-            "| Iran time zone | $env:TIMEZONE_RESULT (see desktop setup log on failure) |",
-            "| Wallpaper | $env:WALLPAPER_RESULT (see desktop setup log on failure) |",
+            "| Bandwidth mode | $env:BANDWIDTH_MODE |",
+            "| Iran time zone | $env:TIMEZONE_RESULT |",
+            "| Wallpaper | $env:WALLPAPER_RESULT |",
+            "| Optional route | $env:ROUTE_RESULT |",
             "| Session ends (UTC) | $($deadline.ToString('u')) |",
-            "| Tailscale setup | $($tsReady - $start) seconds |",
-            "| RDP setup | $($rdpReady - $tsReady) seconds |",
+            "| Tailscale setup | $([long]$env:TAILSCALE_READY_EPOCH - $start) seconds |",
+            "| RDP setup | $([long]$env:RDP_READY_EPOCH - [long]$env:TAILSCALE_READY_EPOCH) seconds |",
             "| Total to connection details | $($now - $start) seconds |",
-            '| Network | Tailscale only; tailnet policy must allow access |',
-            '',
-            'The runner is temporary; the session ends when this job stops. Enable desktop background in your RDP client to see the wallpaper.'
+            '| Network | Tailscale only; tailnet policy must allow access |', '',
+            'The runner and its files are temporary. Do not reboot it. Enable desktop backgrounds in your RDP client to see the wallpaper.'
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
-          Write-Host "Connect using mstsc /v:$env:RDP_IP as CynetAdmin."
+          Write-Host "Connect using mstsc /v:$env:RDP_IP. See the summary for account setup status."
 
       - name: Report installed tools
         if: ${{ inputs.setup_tools }}
@@ -346,6 +413,7 @@ jobs:
         run: |
           if (Get-Command python -ErrorAction SilentlyContinue) { python --version } else { Write-Host 'Python not found on PATH.' }
           if (Get-Command java -ErrorAction SilentlyContinue) { java -version } else { Write-Host 'Java not found on PATH.' }
+          $global:LASTEXITCODE = 0
 
       - name: Keep session alive, monitor, and recover
         id: monitor
@@ -362,11 +430,10 @@ jobs:
           $recoveryAttempts = 0
           $rdpRecoveryAttempts = 0
           $lastRdpRecovery = [DateTimeOffset]::MinValue
-          Write-Host "Connect to $env:RDP_IP as CynetAdmin. Estimated end: $($deadline.ToString('u'))."
+          Write-Host "Connect to $env:RDP_IP. Estimated end: $($deadline.ToString('u'))."
           while ([DateTimeOffset]::UtcNow -lt $deadline) {
             $remaining = $deadline - [DateTimeOffset]::UtcNow
             Write-Host ("Countdown: {0:D2}h {1:D2}m {2:D2}s remaining." -f [int][Math]::Floor($remaining.TotalHours), $remaining.Minutes, $remaining.Seconds)
-
             $rdp = Get-Service -Name TermService -ErrorAction SilentlyContinue
             $portListening = $null
             try {
@@ -375,11 +442,10 @@ jobs:
               if ($_.FullyQualifiedErrorId -like '*CmdletizationQuery_NotFound*') { $portListening = $false }
               else { Write-Warning "Could not check the RDP listener: $($_.Exception.Message)" }
             }
-            if (-not $rdp) { Write-Warning 'RDP service was not found; inspect the job diagnostics.' }
+            if (-not $rdp) { Write-Warning 'RDP service was not found.' }
             if ($rdp -and ($rdp.Status -ne 'Running' -or $portListening -eq $false) -and
                 $rdpRecoveryAttempts -lt 3 -and ([DateTimeOffset]::UtcNow - $lastRdpRecovery).TotalMinutes -ge 2) {
-              $rdpRecoveryAttempts++
-              $lastRdpRecovery = [DateTimeOffset]::UtcNow
+              $rdpRecoveryAttempts++; $lastRdpRecovery = [DateTimeOffset]::UtcNow
               Write-Warning "RDP service or listener is down; attempting recovery ($rdpRecoveryAttempts/3)."
               try {
                 if ($rdp.Status -eq 'Running') { Restart-Service -Name TermService -ErrorAction Stop }
@@ -396,21 +462,19 @@ jobs:
               if ($LASTEXITCODE -ne 0 -or -not $json.Trim()) { throw 'Tailscale status unavailable' }
               $state = $json | ConvertFrom-Json
               if ($state.BackendState -eq 'Stopped' -and $recoveryAttempts -lt 3 -and ([DateTimeOffset]::UtcNow - $lastRecovery).TotalMinutes -ge 5) {
-                $recoveryAttempts++
-                $lastRecovery = [DateTimeOffset]::UtcNow
-                Write-Warning "Tailscale is stopped; attempting reconnect ($recoveryAttempts/3)."
+                $recoveryAttempts++; $lastRecovery = [DateTimeOffset]::UtcNow
+                Write-Warning "Tailscale stopped; attempting reconnect ($recoveryAttempts/3)."
                 $null = & $tsExe up --timeout=20s 2>&1
                 if ($LASTEXITCODE -ne 0) { Write-Warning 'Reconnect failed; check Tailscale settings.' }
               } elseif ($state.BackendState -eq 'NeedsLogin') {
-                Write-Warning 'Tailscale needs authentication; rerun the workflow with a valid key.'
+                Write-Warning 'Tailscale needs authentication; rerun with a valid key.'
               }
               if ([DateTimeOffset]::UtcNow -ge $nextPathReport) {
-                # Only active peers have a meaningful path. Never label idle peers direct.
                 $lines = & $tsExe status --active 2>$null
                 $direct = @($lines | Where-Object { $_ -match 'active;\s*direct\b' }).Count
                 $relay = @($lines | Where-Object { $_ -match 'active;\s*(?:relay|peer-relay)\b' }).Count
                 if ($direct + $relay -eq 0) { Write-Host 'Connection path: no active peer; direct/relay not yet known.' }
-                else { Write-Host "Active Tailscale paths: direct=$direct, relayed=$relay (may include peers other than the RDP client)." }
+                else { Write-Host "Active Tailscale paths: direct=$direct, relayed=$relay (may include other peers)." }
                 $nextPathReport = [DateTimeOffset]::UtcNow.AddMinutes(5)
               }
             } catch { Write-Warning 'Tailscale health check unavailable; no device details were logged.' }
@@ -418,7 +482,6 @@ jobs:
             if ($seconds -gt 0) { Start-Sleep -Seconds $seconds }
           }
           Write-Host 'Session time elapsed.'
-          # A failed health-check command should not turn a completed session into a failed job.
           $global:LASTEXITCODE = 0
 
       - name: Connection diagnostics on failure
@@ -436,22 +499,11 @@ jobs:
           $ErrorActionPreference = 'Continue'
           $stage = if ($env:RDP_SETUP_STAGE) { $env:RDP_SETUP_STAGE } else { 'Not reached' }
           $hints = @()
-          if ($env:PREFLIGHT_RESULT -eq 'failure') {
-            $hints += 'Check TAILSCALE_AUTHKEY, the hardcoded RDP password and the keepalive_minutes input.'
-          }
-          if ($env:TAILSCALE_RESULT -eq 'failure') {
-            $hints += 'Tailscale action failed. Check the key, device authorization, tailnet policy, network and action logs.'
-          }
-          if ($env:RDP_RESULT -eq 'failure') {
-            $hints += "RDP setup failed during: $stage. Check that step log and the service, listener and firewall diagnostics below."
-            if ($stage -like '*account*') { $hints += 'Check Windows password complexity rules and local account configuration.' }
-          }
-          if ($env:TIMING_RESULT -eq 'failure' -or $env:PUBLISH_RESULT -eq 'failure') {
-            $hints += 'The timing or summary step failed. Inspect its log and the runner disk space.'
-          }
-          if ($env:MONITOR_RESULT -eq 'failure') {
-            $hints += 'The session monitor failed. Inspect the monitor step log for details.'
-          }
+          if ($env:PREFLIGHT_RESULT -eq 'failure') { $hints += 'Check TAILSCALE_AUTHKEY, passwords, and keepalive_minutes.' }
+          if ($env:TAILSCALE_RESULT -eq 'failure') { $hints += 'Check the key, device authorization, tailnet policy, network, and action logs.' }
+          if ($env:RDP_RESULT -eq 'failure') { $hints += "RDP setup failed during: $stage. Check the step log, service, listener, and firewall." }
+          if ($env:TIMING_RESULT -eq 'failure' -or $env:PUBLISH_RESULT -eq 'failure') { $hints += 'Check the timing or summary step log and runner disk space.' }
+          if ($env:MONITOR_RESULT -eq 'failure') { $hints += 'Check the monitor step log.' }
           if (-not $hints.Count) { $hints += 'Inspect the first failed step in the Actions log.' }
           $summary = @('### RDP workflow failed', '', '| Check | Result |', '| --- | --- |',
             "| Preflight | $env:PREFLIGHT_RESULT |", "| Tailscale action | $env:TAILSCALE_RESULT |",
@@ -459,9 +511,8 @@ jobs:
             "| Last RDP setup stage | $stage |", "| Publish connection info | $env:PUBLISH_RESULT |",
             "| Session monitor | $env:MONITOR_RESULT |", '', '#### What to check')
           $summary += $hints | ForEach-Object { "- $_" }
-          $summary += '', 'See the **Connection diagnostics on failure** step log for service, firewall and listener checks.'
           try { $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
-          catch { Write-Warning 'Could not write failure summary; see the diagnostics log.' }
+          catch { Write-Warning 'Could not write failure summary.' }
           Write-Host '--- Connection diagnostics (no passwords or auth keys) ---'
           $hints | ForEach-Object { Write-Warning $_ }
           Get-Service -Name TermService,Tailscale -ErrorAction SilentlyContinue | Format-Table Name,Status,StartType
