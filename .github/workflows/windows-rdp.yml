@@ -12,6 +12,11 @@ on:
         description: 'Minutes to keep the session open after setup (1-340)'
         required: false
         default: '340'
+      max_fps:
+        description: 'Requested maximum RDP frame rate (30-60 FPS; may require restart)'
+        type: number
+        required: false
+        default: 40
       setup_tools:
         description: 'Report preinstalled Python and Java versions'
         type: boolean
@@ -68,7 +73,6 @@ jobs:
           }
           "JOB_START_EPOCH=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV
           "KEEPALIVE_MINUTES=$minutes" >> $env:GITHUB_ENV
-
       - name: Connect to Tailscale
         id: tailscale
         uses: tailscale/github-action@v3
@@ -83,7 +87,6 @@ jobs:
           $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
           "TAILSCALE_READY_EPOCH=$now" >> $env:GITHUB_ENV
           Write-Host "Preflight and Tailscale connection: $($now - [long]$env:JOB_START_EPOCH) seconds."
-
       # This step runs as the same GitHub runner account that started Tailscale.
       # Route approval, forwarding, and reachability are separate requirements.
       - name: Advertise optional Tailscale route
@@ -119,7 +122,6 @@ jobs:
             'ROUTE_RESULT=Failed; see route step log' >> $env:GITHUB_ENV
           }
           $global:LASTEXITCODE = 0
-
       - name: Enable and verify RDP
         id: rdp
         shell: pwsh
@@ -127,8 +129,15 @@ jobs:
           REQUIRE_NLA: ${{ inputs.nla && '1' || '0' }}
           OPTIMIZE_RDP: ${{ inputs.rdp_optimization && '1' || '0' }}
           BANDWIDTH_MODE: ${{ inputs.bandwidth_mode && '1' || '0' }}
+          MAX_FPS: ${{ inputs.max_fps }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $maxFps = 0
+          if (-not [int]::TryParse($env:MAX_FPS, [ref]$maxFps) -or $maxFps -lt 30 -or $maxFps -gt 60) {
+            throw 'max_fps must be an integer between 30 and 60.'
+          }
+          # Windows uses a frame interval in milliseconds: 25 ms requests about 40 FPS.
+          $frameInterval = [int][Math]::Round(1000.0 / $maxFps)
           function Set-RdpStage([string]$Name) {
             Write-Host "RDP setup stage: $Name"
             "RDP_SETUP_STAGE=$Name" >> $env:GITHUB_ENV
@@ -174,7 +183,6 @@ jobs:
           Set-RdpStage 'Finding Tailscale interface'
           $adapter = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $ip -ErrorAction Stop | Select-Object -First 1
           if (-not $adapter.InterfaceAlias) { throw 'Could not identify the Tailscale interface.' }
-
           Set-RdpStage 'Configuring RDP policy'
           $terminalServer = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
           $rdpTcp = "$terminalServer\WinStations\RDP-Tcp"
@@ -182,6 +190,15 @@ jobs:
           Set-ItemProperty -Path $rdpTcp -Name UserAuthentication -Type DWord -Value ([int]$env:REQUIRE_NLA)
           $policy = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
           New-Item -Path $policy -Force | Out-Null
+          $frameIntervalPath = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations'
+          try {
+            New-ItemProperty -Path $frameIntervalPath -Name DWMFRAMEINTERVAL -PropertyType DWord -Value $frameInterval -Force | Out-Null
+            $frameResult = "Requested max $maxFps FPS ($frameInterval ms/frame); Windows restart may be needed for it to take effect"
+          } catch {
+            Write-Warning "Could not set the RDP frame-rate request: $($_.Exception.Message)"
+            $frameResult = 'Could not configure; Windows default applies'
+          }
+          "RDP_FRAME_RATE_RESULT=$frameResult" >> $env:GITHUB_ENV
           if ($env:OPTIMIZE_RDP -eq '1') {
             try {
               New-ItemProperty -Path $policy -Name MaxCompressionLevel -PropertyType DWord -Value 3 -Force | Out-Null
@@ -196,7 +213,6 @@ jobs:
           try {
             New-ItemProperty -Path $policy -Name fNoRemoteDesktopWallpaper -PropertyType DWord -Value ([int]$env:BANDWIDTH_MODE) -Force | Out-Null
           } catch { Write-Warning 'Could not configure optional wallpaper policy.' }
-
           Set-RdpStage 'Creating CynetAdmin account'
           $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
           if (Get-LocalUser -Name 'CynetAdmin' -ErrorAction SilentlyContinue) {
@@ -213,7 +229,6 @@ jobs:
             $exists = Get-LocalGroupMember -Group $group.Name | Where-Object { $_.SID -eq $user.SID }
             if (-not $exists) { Add-LocalGroupMember -Group $group.Name -Member $user.Name }
           }
-
           Set-RdpStage 'Configuring Windows firewall'
           Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
             Disable-NetFirewallRule -ErrorAction Stop
@@ -241,7 +256,6 @@ jobs:
           "RDP_READY_EPOCH=$now" >> $env:GITHUB_ENV
           Write-Host "RDP is listening at Tailscale IPv4 $ip. Setup: $($now - [long]$env:TAILSCALE_READY_EPOCH) seconds."
           $global:LASTEXITCODE = 0
-
       - name: Create Javad administrator account
         id: javad
         shell: pwsh
@@ -285,7 +299,6 @@ jobs:
           }
           "JAVAD_RESULT=$result" >> $env:GITHUB_ENV
           $global:LASTEXITCODE = 0
-
       - name: Set Iran time zone and desktop wallpaper
         id: desktop
         shell: pwsh
@@ -368,7 +381,6 @@ jobs:
           "TIMEZONE_RESULT=$timezoneResult" >> $env:GITHUB_ENV
           "WALLPAPER_RESULT=$wallpaperResult" >> $env:GITHUB_ENV
           $global:LASTEXITCODE = 0
-
       - name: Publish connection information
         id: publish
         shell: pwsh
@@ -393,6 +405,7 @@ jobs:
             "| Javad account | $env:JAVAD_RESULT |",
             "| Network Level Authentication | $env:REQUIRE_NLA |",
             "| RDP optimization | $env:RDP_OPTIMIZATION_RESULT |",
+            "| Requested max RDP FPS | $env:RDP_FRAME_RATE_RESULT |",
             "| Bandwidth mode | $env:BANDWIDTH_MODE |",
             "| Iran time zone | $env:TIMEZONE_RESULT |",
             "| Wallpaper | $env:WALLPAPER_RESULT |",
@@ -405,7 +418,6 @@ jobs:
             'The runner and its files are temporary. Do not reboot it. Enable desktop backgrounds in your RDP client to see the wallpaper.'
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
           Write-Host "Connect using mstsc /v:$env:RDP_IP. See the summary for account setup status."
-
       - name: Report installed tools
         if: ${{ inputs.setup_tools }}
         shell: pwsh
@@ -414,7 +426,6 @@ jobs:
           if (Get-Command python -ErrorAction SilentlyContinue) { python --version } else { Write-Host 'Python not found on PATH.' }
           if (Get-Command java -ErrorAction SilentlyContinue) { java -version } else { Write-Host 'Java not found on PATH.' }
           $global:LASTEXITCODE = 0
-
       - name: Keep session alive, monitor, and recover
         id: monitor
         shell: pwsh
@@ -483,7 +494,6 @@ jobs:
           }
           Write-Host 'Session time elapsed.'
           $global:LASTEXITCODE = 0
-
       - name: Connection diagnostics on failure
         if: ${{ failure() }}
         shell: pwsh
