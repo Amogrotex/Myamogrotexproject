@@ -133,8 +133,8 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $maxFps = 0
-          if (-not [int]::TryParse($env:MAX_FPS, [ref]$maxFps) -or $maxFps -lt 30 -or $maxFps -gt 60) {
-            throw 'max_fps must be an integer between 30 and 60.'
+          if (-not [int]::TryParse($env:MAX_FPS, [ref]$maxFps) -or $maxFps -lt 30 -or $maxFps -gt 120) {
+            throw 'max_fps must be an integer between 30 and 120.'
           }
           # Windows uses a frame interval in milliseconds: 25 ms requests about 40 FPS.
           $frameInterval = [int][Math]::Round(1000.0 / $maxFps)
