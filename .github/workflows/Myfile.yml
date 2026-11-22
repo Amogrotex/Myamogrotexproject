@@ -1,0 +1,319 @@
+name: Cloudflared File Host
+
+# Single self-contained workflow.
+# Hosts a file-upload server behind a Cloudflared Quick Tunnel. This file
+# writes the server itself at runtime — nothing else needs to live in the repo.
+#
+# Endpoints exposed on the public *.trycloudflare.com URL:
+#   POST /upload       multipart field "file", any file type,
+#                      up to the max size (default 200 GB)
+#                      -> {"hash", "name", "size", "url"}
+#   GET  /d/<sha256>   direct streamed download (the link opens and downloads
+#                      the file straight through, no middle page)
+#   GET  /             simple browser upload form
+#   GET  /health       liveness probe
+#
+# Usage: Actions tab -> "Cloudflared File Host" -> Run workflow.
+# The public URL is written to the job summary and the job output "tunnel_url".
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_size_gb:
+        description: 'Maximum upload size in GB (server-side limit)'
+        required: false
+        default: '200'
+
+jobs:
+  file-host:
+    # NOTE: GitHub-hosted runners have only ~14 GB of disk and can't hold real
+    # 200 GB files. For true 200 GB uploads, point this at a self-hosted runner
+    # with a large volume:
+    #   runs-on: [self-hosted, big-disk]
+    runs-on: ubuntu-latest
+
+    # GitHub jobs are capped at 360 minutes; leave headroom for the keep-alive loop.
+    timeout-minutes: 350
+
+    env:
+      MAX_SIZE_GB: ${{ github.event.inputs.max_size_gb }}
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install server dependencies
+        run: pip install --no-cache-dir aiohttp
+
+      - name: Write the file host server
+        run: |
+          mkdir -p filehost
+          cat > filehost/server.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Direct file-upload host meant to run behind a Cloudflare tunnel.
+
+          Upload any file type (server-side size limit via MAX_SIZE_BYTES,
+          default 200 GB). The server hashes the content (SHA-256) and returns
+          a direct download link:
+
+              GET  /                simple upload form
+              POST /upload          multipart/form-data, field name: "file"
+                      -> {"hash", "name", "size", "url"}
+              GET  /d/<sha256>     direct streamed download (range-friendly)
+              GET  /health          liveness probe
+          """
+
+          import hashlib
+          import os
+          import re
+
+          from aiohttp import web
+
+          BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+          UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(BASE_DIR, "uploads"))
+          MAX_SIZE_BYTES = int(os.environ.get("MAX_SIZE_BYTES", str(200 * 1024 ** 3)))
+          PORT = int(os.environ.get("PORT", "8080"))
+          CHUNK_SIZE = 4 * 1024 * 1024  # 4 MiB
+
+          HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+          os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+
+          def _safe_name(name: str) -> str:
+              name = os.path.basename(name.replace("\\", "/")) or "download"
+              name = name.replace('"', "").replace("\n", "").replace("\r", "")
+              return name[:200]
+
+
+          async def handle_index(_request: web.Request) -> web.Response:
+              html = f"""<!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>File Host</title>
+          <style>
+            body {{ font-family: system-ui, sans-serif; max-width: 640px; margin: 3rem auto; padding: 0 1rem; }}
+            input[type=file] {{ display: block; margin: 1rem 0; }}
+            button {{ padding: .5rem 1.25rem; font-size: 1rem; cursor: pointer; }}
+            pre {{ background: #f4f4f4; padding: 1rem; overflow-x: auto; white-space: pre-wrap; }}
+            a {{ word-break: break-all; }}
+          </style>
+          </head>
+          <body>
+            <h1>File Host</h1>
+            <p>Max upload size: {MAX_SIZE_BYTES // (1024 ** 3)} GB. Any file type.
+               You get a direct hashed download link.</p>
+            <form id="f">
+              <input type="file" id="file" name="file" required>
+              <button type="submit">Upload</button>
+            </form>
+            <pre id="out">Waiting&hellip;</pre>
+            <script>
+              document.getElementById('f').addEventListener('submit', async (e) => {{
+                e.preventDefault();
+                const out = document.getElementById('out');
+                const file = document.getElementById('file').files[0];
+                if (!file) return;
+                out.textContent = 'Uploading ' + file.name + '\u2026';
+                const fd = new FormData();
+                fd.append('file', file);
+                try {{
+                  const r = await fetch('/upload', {{ method: 'POST', body: fd }});
+                  const j = await r.json();
+                  if (!r.ok) throw new Error(j.error || 'upload failed');
+                  out.innerHTML =
+                    'Hash: ' + j.hash + '\n' +
+                    'Name: ' + j.name + '\n' +
+                    'Size: ' + j.size + ' bytes\n' +
+                    'Direct link: <a href="' + j.url + '">' + j.url + '</a>';
+                }} catch (err) {{
+                  out.textContent = 'Error: ' + err.message;
+                }}
+              }});
+            </script>
+          </body>
+          </html>"""
+              return web.Response(text=html, content_type="text/html")
+
+
+          async def handle_upload(request: web.Request) -> web.Response:
+              try:
+                  reader = await request.multipart()
+              except Exception:
+                  return web.json_response(
+                      {"error": "expected a multipart/form-data body"}, status=400
+                  )
+
+              file_part = None
+              filename = "file"
+              async for part in reader:
+                  if part.filename:
+                      file_part = part
+                      filename = part.filename
+                      break
+              if file_part is None:
+                  return web.json_response(
+                      {"error": "no file found; use a multipart field named 'file'"},
+                      status=400,
+                  )
+
+              digest = hashlib.sha256()
+              size = 0
+              tmp_path = os.path.join(UPLOAD_DIR, ".uploading.tmp")
+              stored = False
+              try:
+                  with open(tmp_path, "wb") as out:
+                      while True:
+                          chunk = await file_part.read_chunk(CHUNK_SIZE)
+                          if not chunk:
+                              break
+                          size += len(chunk)
+                          if size > MAX_SIZE_BYTES:
+                              return web.json_response(
+                                  {"error": f"file exceeds the {MAX_SIZE_BYTES // (1024 ** 3)} GB limit"},
+                                  status=413,
+                              )
+                          digest.update(chunk)
+                          out.write(chunk)
+                  stored = True
+              except Exception as exc:
+                  return web.json_response({"error": f"upload failed: {exc}"}, status=500)
+              finally:
+                  if not stored:
+                      try:
+                          os.remove(tmp_path)
+                      except OSError:
+                          pass
+
+              digest_hex = digest.hexdigest()
+              final_path = os.path.join(UPLOAD_DIR, digest_hex)
+              if os.path.exists(final_path):
+                  # Identical content already stored — reuse the existing copy.
+                  try:
+                      os.remove(tmp_path)
+                  except OSError:
+                      pass
+              else:
+                  os.replace(tmp_path, final_path)
+              with open(final_path + ".name", "w") as fh:
+                  fh.write(_safe_name(filename))
+
+              base = f"{request.scheme}://{request.host}"
+              return web.json_response(
+                  {
+                      "hash": digest_hex,
+                      "name": filename,
+                      "size": size,
+                      "url": f"{base}/d/{digest_hex}",
+                      "download": f"{base}/d/{digest_hex}",
+                  }
+              )
+
+
+          async def handle_download(request: web.Request) -> web.StreamResponse:
+              digest = request.match_info["digest"]
+              if not HASH_RE.match(digest):
+                  return web.Response(status=404)
+              path = os.path.join(UPLOAD_DIR, digest)
+              if not os.path.isfile(path):
+                  return web.Response(status=404)
+
+              name = "download"
+              name_file = path + ".name"
+              if os.path.isfile(name_file):
+                  try:
+                      with open(name_file) as fh:
+                          name = _safe_name(fh.read())
+                  except OSError:
+                      pass
+
+              response = web.FileResponse(path)
+              response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+              return response
+
+
+          async def handle_health(_request: web.Request) -> web.Response:
+              return web.json_response({"ok": True})
+
+
+          # client_max_size=0 disables aiohttp's 1 MiB default; our own
+          # MAX_SIZE_BYTES limit is enforced while streaming the upload to disk.
+          app = web.Application(client_max_size=0)
+          app.router.add_get("/", handle_index)
+          app.router.add_get("/health", handle_health)
+          app.router.add_post("/upload", handle_upload)
+          app.router.add_get("/d/{digest}", handle_download)
+
+          if __name__ == "__main__":
+              print(
+                  f"file host listening on :{PORT}, "
+                  f"max upload {MAX_SIZE_BYTES / 1024 ** 3:.0f} GB, "
+                  f"storage: {UPLOAD_DIR}"
+              )
+              web.run_app(app, host="0.0.0.0", port=PORT, print=None)
+          PYEOF
+          echo "file host server written to filehost/server.py"
+
+      - name: Start file server
+        run: |
+          export MAX_SIZE_BYTES=$(( MAX_SIZE_GB * 1024 * 1024 * 1024 ))
+          echo "Starting server with MAX_SIZE_BYTES=$MAX_SIZE_BYTES"
+          nohup python3 filehost/server.py > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8080/health > /dev/null; then
+              echo "File server up on :8080"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "File server failed to start"; cat server.log; exit 1
+
+      - name: Install cloudflared
+        run: |
+          case "$(uname -m)" in
+            x86_64) ARCH=amd64 ;;
+            aarch64 | arm64) ARCH=arm64 ;;
+            *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL -o /usr/local/bin/cloudflared \
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
+          chmod +x /usr/local/bin/cloudflared
+
+      - name: Start cloudflared tunnel
+        run: |
+          nohup cloudflared tunnel --url http://127.0.0.1:8080 --no-autoupdate > cloudflared.log 2>&1 &
+          echo $! > cloudflared.pid
+          TUNNEL_URL=""
+          for i in $(seq 1 60); do
+            TUNNEL_URL=$(grep -oE 'https://[A-Za-z0-9_-]+\.trycloudflare\.com' cloudflared.log | head -n 1)
+            if [ -n "$TUNNEL_URL" ]; then break; fi
+            sleep 2
+          done
+          if [ -z "$TUNNEL_URL" ]; then
+            echo "cloudflared failed to register a tunnel"; cat cloudflared.log; exit 1
+          fi
+          echo "tunnel_url=$TUNNEL_URL" >> "$GITHUB_OUTPUT"
+          {
+            echo "## Cloudflared File Host"
+            echo
+            echo "**Public URL:** $TUNNEL_URL"
+            echo
+            echo "**Upload:** \`POST $TUNNEL_URL/upload\` (multipart field \`file\`)"
+            echo "**Direct download:** \`$TUNNEL_URL/d/<sha256>\`"
+            echo "**Web form:** $TUNNEL_URL/"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::Public tunnel URL: $TUNNEL_URL"
+
+      - name: Keep the tunnel alive while the server runs
+        run: |
+          # The job must stay alive for the tunnel to stay up. It ends when the
+          # file server dies or the 350-minute timeout hits.
+          while kill -0 "$(cat server.pid)" 2>/dev/null; do
+            sleep 30
+          done
+          echo "File server exited; ending job."
